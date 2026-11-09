@@ -1,85 +1,53 @@
-from __future__ import annotations
-
+import torch
 import math
 from collections.abc import Callable, Iterable
 
-import torch
-
-
-def get_cosine_lr(
-    it: int,
-    max_learning_rate: float,
-    min_learning_rate: float,
-    warmup_iters: int,
-    cosine_cycle_iters: int,
-):
-    """Cosine with warmup learning rate scheduler."""
-    # First, we linearly warmup for warmup_iters steps.
-    if it < warmup_iters:
-        return max_learning_rate * it / warmup_iters
-    # Then, if it > cosine_cycle_iters, we return min learning rate.
-    if it > cosine_cycle_iters:
-        return min_learning_rate
-    # Else, we use cosine decay down to min learning rate.
-    decay_ratio = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_learning_rate + coeff * (max_learning_rate - min_learning_rate)
-
-
 class AdamW(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params: Iterable[torch.nn.parameter.Parameter],
-        lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
-    ):
-        if not 0.0 <= lr:
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        if lr < 0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
         super().__init__(params, defaults)
 
-    def step(self, closure: Callable | None = None):
-        loss = None
-        if closure is not None:
-            loss = closure()
+    def step(self):
         for group in self.param_groups:
+            # Get hyperparameters for this group
+            lr, betas, eps, weight_decay = group["lr"], group["betas"], group["eps"], group["weight_decay"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
-
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError("Adam does not support sparse gradients")
-
+                # States for one param include m, v, t
                 state = self.state[p]
-                alpha = group["lr"]
-                beta_1, beta_2 = group["betas"]
-                eps = group["eps"]
+                prev_m = state.get("m", torch.zeros_like(p))
+                prev_v = state.get("v", torch.zeros_like(p))
                 t = state.get("t", 1)
-
+                # Get the grad for update
+                grad = p.grad.data
+                # Compute adjusted learning rate for iteration t
+                lr_t = lr * math.sqrt(1 - betas[1] ** t) / (1 - betas[0] ** t)
                 # Apply weight decay
-                alpha_t = alpha * (math.sqrt(1 - (beta_2**t)) / (1 - (beta_1**t)))
-                p.data -= alpha * group["weight_decay"] * p.data
-
-                prev_m_t = state.get("m", torch.zeros_like(grad))
-                prev_v_t = state.get("v", torch.zeros_like(grad))
-
-                m_t = beta_1 * prev_m_t + ((1 - beta_1) * grad)
-                v_t = beta_2 * prev_v_t + ((1 - beta_2) * torch.square(grad))
-
-                # Apply adjusted gradient step
-                p.data -= alpha_t * m_t / (torch.sqrt(v_t) + eps)
-
-                state["m"] = m_t
-                state["v"] = v_t
+                p.data -= lr * weight_decay * p.data
+                # Update the first moment estimate
+                m = betas[0] * prev_m + (1 - betas[0]) * grad
+                # Update the second moment estimate
+                v = betas[1] * prev_v + ((1 - betas[1]) * torch.square(grad))
+                # Apply moment-adjusted weight update
+                p.data -= lr_t * m / (torch.sqrt(v) + eps)
+                # Record state
+                state["m"] = m
+                state["v"] = v
                 state["t"] = t + 1
-        return loss
+
+def get_lr_cosine(
+        t: int,
+        max_lr: float,
+        min_lr: float,
+        warmup_it_num: int,
+        final_it_num: int,
+):
+    if t < warmup_it_num:
+        return t * max_lr / warmup_it_num
+    elif warmup_it_num <= t <= final_it_num:
+        return min_lr + 0.5 * (1 + math.cos(math.pi * (t - warmup_it_num) / (final_it_num - warmup_it_num))) * (max_lr - min_lr)
+    else:
+        return min_lr

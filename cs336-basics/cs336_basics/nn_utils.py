@@ -1,31 +1,24 @@
 import torch
+from einops import einsum, rearrange
+from jaxtyping import Bool, Float, Int
 
+def cross_entropy(logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."]):
+    logits = rearrange(logits, "... vocab_size -> (...) vocab_size") # logits: (batch_size, vocab_size), 
+                                                                    # where batch_size can be many top-level batches of many sequences combined
+    targets = rearrange(targets, "... -> (...)") # targets: (batch_size)
+    logits = logits - logits.amax(dim=-1, keepdim=True)
+    logits_log_sum_per_pos = torch.log(torch.exp(logits).sum(dim=-1)) # (batch_size)
+    target_logits_per_pos = torch.gather(logits, dim=-1, index=targets.unsqueeze(dim=-1)).squeeze(dim=-1) # (batch_size)
+    return torch.mean(logits_log_sum_per_pos - target_logits_per_pos)
 
-def softmax(x, dim=-1):
-    rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
-    exponentiated_rescaled_input = torch.exp(rescaled_input)
-    return exponentiated_rescaled_input / torch.sum(exponentiated_rescaled_input, dim=dim, keepdim=True)
-
-
-def log_softmax(x, dim=-1):
-    x_max = torch.max(x, dim=dim, keepdim=True)[0]
-    x = x - x_max
-    return x - torch.log(torch.sum(torch.exp(x), dim=dim, keepdim=True))
-
-
-def cross_entropy(inputs, targets):
-    negative_log_softmax_logits = -log_softmax(inputs)
-    return torch.mean(torch.gather(negative_log_softmax_logits, -1, targets.unsqueeze(-1)))
-
-
-def clip_gradient(parameters, max_norm):
-    grads = [p.grad for p in parameters if p.grad is not None]
+def gradient_clipping(params, max_norm):
+    eps = 1e-6
+    grads = [p.grad for p in params if p.grad is not None]
     norm = torch.tensor(0.0, device=grads[0].device)
 
     for g in grads:
-        norm += (g**2).sum()
-
+        norm += torch.square(g).sum()
     norm = torch.sqrt(norm)
-    clip_coef = min(1, max_norm / (norm + 1e-6))
+    clip_factor = min(max_norm / (norm + eps), 1)
     for g in grads:
-        g *= clip_coef
+        g *= clip_factor

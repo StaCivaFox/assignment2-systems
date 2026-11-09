@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from cs336_systems import flash_attention, ddp
 
 
 
@@ -14,7 +15,7 @@ def get_flashattention_autograd_function_pytorch() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyFlashAttnAutogradFunctionClass
-    raise NotImplementedError
+    return flash_attention.FlashAttentionFunc
 
 
 def get_flashattention_autograd_function_triton() -> type:
@@ -30,7 +31,7 @@ def get_flashattention_autograd_function_triton() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
-    raise NotImplementedError
+    return flash_attention.FlashAttentionFuncTriton
 
 
 def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
@@ -51,7 +52,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDP(module)
-    raise NotImplementedError
+    return ddp.FlatDDP(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -66,7 +67,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    return ddp_model.synchronize_gradients()
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
