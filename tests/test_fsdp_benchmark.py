@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from cs336_basics.model import Embedding, Linear, RMSNorm
-from cs336_systems.fsdp_benchmark import expected_memory, storage_breakdown
+from cs336_systems.fsdp_benchmark import expected_memory, parse_args, storage_breakdown
 from cs336_systems.modal_runner import FSDP_NSYS_ARGS, command_argv, fsdp_jobs, write_summary
 from .test_ddp_training import launch
 
@@ -32,8 +33,38 @@ def test_accounting_counts_aliased_gradients_once():
     assert result["accounted_storage_bytes"] == 32
 
 
+def test_staged_gradient_accounting_survives_installation():
+    module = torch.nn.Linear(2, 2, bias=False)
+    full = torch.empty(8)
+    full.untyped_storage().resize_(0)
+    staged = torch.ones_like(module.weight)
+    state = SimpleNamespace(local_shard=module.weight, full_weight=full, reduced_grad=staged)
+    module.state_by_parameter = {module.weight: state}
+    optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+
+    # Completed gradients live only in WeightState before the final drain.
+    before = storage_breakdown(module, optimizer)
+    assert before["gradients_bytes"] == before["staged_gradients_bytes"] == 16
+    assert before["gathered_weights_bytes"] == 0
+    assert before["accounted_storage_bytes"] == 32
+
+    # Even during transfer, aliases of the staged gradient count only once.
+    module.weight.grad = staged
+    assert storage_breakdown(module, optimizer)["accounted_storage_bytes"] == 32
+    state.reduced_grad = None
+    after = storage_breakdown(module, optimizer)
+    assert after["gradients_bytes"] == 16
+    assert after["staged_gradients_bytes"] == 0
+    assert after["accounted_storage_bytes"] == before["accounted_storage_bytes"]
+
+
+def test_zero_queue_limit_rejected(tmp_path):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-pending", "0", "--output-dir", str(tmp_path)])
+
+
 def test_fsdp_modal_plan_and_capture():
-    jobs = fsdp_jobs(profile_layers=True, allocator_conf="expandable_segments:True")
+    jobs = fsdp_jobs(profile_layers=True, allocator_conf="expandable_segments:True", extra_args="--max-pending 1")
     assert len(jobs) == 3
     for strategy, job in zip(("ddp", "optimizer_sharded", "fsdp"), jobs, strict=True):
         assert job["name"] == f"{strategy}-float32-accounting"
@@ -43,6 +74,7 @@ def test_fsdp_modal_plan_and_capture():
         assert "--nvtx-capture=fsdp_measurement" in command
         assert "--profile-layers" in command
         assert "--nproc-per-node=2" in command
+        assert command[command.index("--max-pending") + 1] == "1"
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -72,15 +104,26 @@ def test_two_rank_accounting_strategies(tmp_path):
             assert phases["before_optimizer"]["optimizer_states_bytes"] > 0
             assert phases["before_optimizer"]["communication_buffers_bytes"] == 0
             if strategy == "fsdp":
-                assert result["config"]["fsdp_weight_lifecycle"] == "reshard_after_forward"
+                assert result["config"]["fsdp_weight_lifecycle"] == "reshard_after_forward_and_backward"
+                assert result["config"]["fsdp_max_pending"] == 2
                 assert phases["after_forward"]["gathered_weights_bytes"] == 0
-                assert phases["after_backward_before_sync"]["gathered_weights_bytes"] > 0
+                assert phases["after_backward_before_sync"]["gathered_weights_bytes"] == 0
+                assert phases["after_backward_before_sync"]["staged_gradients_bytes"] > 0
+                assert 0 < phases["after_backward_before_sync"]["pending_reductions"] <= 2
                 assert phases["after_backward_before_sync"]["communication_buffers_bytes"] > 0
                 assert phases["before_optimizer"]["gathered_weights_bytes"] == 0
+                assert phases["before_optimizer"]["staged_gradients_bytes"] == 0
+                assert phases["before_optimizer"]["pending_reductions"] == 0
+                assert phases["before_optimizer"]["gradients_bytes"] == phases["before_optimizer"]["master_weights_bytes"]
                 forward_layers = {name.removeprefix("forward/") for name in rank["all_gather_path"] if name.startswith("forward/")}
                 backward_layers = {name.removeprefix("backward/") for name in rank["all_gather_path"] if name.startswith("backward/")}
                 assert forward_layers and forward_layers == backward_layers
                 assert all(len(t["samples_ms"]) == 2 for t in rank["all_gather_path"].values())
+                stats = rank["profile_stats"]
+                assert stats["max_pending_observed"] == 2
+                assert set(stats["backward_weight_releases"]) == forward_layers
+                assert all(count == 2 for count in stats["backward_weight_releases"].values())
+                assert stats["completed_reductions"] > len(forward_layers) * 2  # Also replicated norms.
         assert (destination / "memory.csv").is_file()
         assert (destination / "report.md").is_file()
         records.append({"name": strategy, "status": "success", "returncode": 0})
@@ -96,12 +139,16 @@ def test_two_rank_accounting_strategies(tmp_path):
 
 
 def test_two_rank_fsdp_bfloat16_accounting(tmp_path):
-    launch("fsdp_benchmark", tmp_path, "--strategy", "fsdp", "--compute-dtype", "bfloat16", "--warmup-steps", "1", "--steps", "2")
+    launch("fsdp_benchmark", tmp_path, "--strategy", "fsdp", "--compute-dtype", "bfloat16", "--warmup-steps", "1", "--steps", "2", "--max-pending", "1")
     result = json.loads((tmp_path / "timings.json").read_text())
     assert result["config"]["mixed_precision"]
     for rank in result["ranks"]:
         phases = rank["memory_phases"]
-        # Storage is released after forward and reallocated in BF16 for backward.
+        # Full weights are released in both phases, while local gradients stay FP32.
         assert phases["after_forward"]["gathered_weights_bytes"] == 0
-        assert phases["after_backward_before_sync"]["gathered_weights_bytes"] == result["prediction"]["sharded_parameter_count"] * 2
+        assert phases["after_backward_before_sync"]["gathered_weights_bytes"] == 0
+        assert phases["after_backward_before_sync"]["staged_gradients_bytes"] > 0
+        assert phases["after_backward_before_sync"]["pending_reductions"] == 1
+        assert phases["before_optimizer"]["pending_reductions"] == 0
+        assert phases["before_optimizer"]["staged_gradients_bytes"] == 0
         assert phases["before_optimizer"]["gradients_bytes"] == phases["before_optimizer"]["master_weights_bytes"]

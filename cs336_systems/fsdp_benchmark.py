@@ -43,6 +43,7 @@ def parse_args(argv=None):
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--global-batch-size", type=int, default=4)
     parser.add_argument("--compute-dtype", choices=DTYPES, default="float32")
+    parser.add_argument("--max-pending", type=int, default=2, help="FSDP reduction queue limit; ignored by other strategies")
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--backend", choices=("nccl", "gloo"), default="nccl")
@@ -61,6 +62,8 @@ def parse_args(argv=None):
         parser.error("steps, warmup-steps, global-batch-size, cpu-threads, and timeout-seconds must be positive")
     if args.seed < 0 or not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error("seed and weight-decay must be nonnegative; weight-decay must be finite")
+    if args.max_pending < 1:
+        parser.error("max-pending must be positive")
     args.train_data = None  # Reuse the deterministic synthetic TokenBatches helper.
     return args
 
@@ -103,18 +106,17 @@ def storage_breakdown(model, optimizer):
     """Count distinct tensor storages, so aliases/views are not counted twice."""
     states = getattr(model, "state_by_parameter", {})
     local_optimizer = optimizer.local_optimizer if isinstance(optimizer, ShardedOptimizer) else optimizer
+    staged_gradients = [s.reduced_grad for s in states.values() if s.reduced_grad is not None]
     categories = {
         "master_weights": [states[p].local_shard if p in states else p for p in model.parameters()],
         "gathered_weights": [s.full_weight for s in states.values() if s.full_weight is not None],
-        "gradients": [p.grad for p in model.parameters() if p.grad is not None],
+        "gradients": [p.grad for p in model.parameters() if p.grad is not None] + staged_gradients,
         "optimizer_states": list(tensor_values(local_optimizer.state)) if local_optimizer is not None else [],
         # Includes retained reduce-scatter inputs/outputs. Replicated gradients
         # and DDP gradient references are already counted above.
         "communication_buffers": list(tensor_values(getattr(model, "pending", []))),
     }
-    seen = set()
-    result = {}
-    for category, tensors in categories.items():
+    def count_storage(tensors, seen):
         size = 0
         for tensor in tensors:
             storage = tensor.untyped_storage()
@@ -122,8 +124,14 @@ def storage_breakdown(model, optimizer):
             if storage.nbytes() and key not in seen:
                 seen.add(key)
                 size += storage.nbytes()
-        result[category + "_bytes"] = size
+        return size
+
+    seen = set()
+    result = {category + "_bytes": count_storage(tensors, seen) for category, tensors in categories.items()}
     result["accounted_storage_bytes"] = sum(result.values())
+    # This is a subset of gradients_bytes, not an additional storage category.
+    result["staged_gradients_bytes"] = count_storage(staged_gradients, set())
+    result["pending_reductions"] = len(getattr(model, "pending", []))
     return result
 
 
@@ -162,6 +170,48 @@ class ProfiledFSDP(FSDP):
         device = self.weight_states[layer].local_shard.device
         with nvtx_range(f"weight_reshard/forward/{self.layer_names[layer]}", device):
             return super()._after_forward(layer, inputs, output)
+
+    def _after_backward(self, layer, grad_input, grad_output):
+        if not self.measure_gathers:
+            return super()._after_backward(layer, grad_input, grad_output)
+        state = self.weight_states[layer]
+        allocated = state.full_buffer.untyped_storage().nbytes() > 0
+        with nvtx_range(f"backward_input_ready/{self.layer_names[layer]}", state.local_shard.device):
+            result = super()._after_backward(layer, grad_input, grad_output)
+        self._record_backward_release(state, allocated)
+        return result
+
+    def _gradient_ready(self, parameter):
+        if not self.measure_gathers:
+            return super()._gradient_ready(parameter)
+        state = self.state_by_parameter.get(parameter)
+        allocated = state is not None and state.full_buffer.untyped_storage().nbytes() > 0
+        with nvtx_range(f"gradient_ready/{self.parameter_names[parameter]}", parameter.device):
+            result = super()._gradient_ready(parameter)
+        self.profile_stats["max_pending_observed"] = max(self.profile_stats["max_pending_observed"], len(self.pending))
+        if state is not None:
+            self._record_backward_release(state, allocated)
+        return result
+
+    def _record_backward_release(self, state, was_allocated):
+        if was_allocated and state.full_buffer.untyped_storage().nbytes() == 0:
+            name = self.parameter_layer_names[state.parameter]
+            counts = self.profile_stats["backward_weight_releases"]
+            counts[name] = counts.get(name, 0) + 1
+            if state.local_shard.is_cuda:
+                torch.cuda.nvtx.mark(f"weight_reshard/backward/{name}")
+
+    def _complete_oldest(self):
+        if not self.measure_gathers:
+            return super()._complete_oldest()
+        state, _, reduced_grad, _ = self.pending[0]
+        kind = "all_reduce" if state is None else "reduce_scatter"
+        # Includes the implementation's CUDA stream synchronize; do not add
+        # synchronization or alter queue scheduling just for instrumentation.
+        with nvtx_range(f"gradient_reduction_wait/{kind}", reduced_grad.device):
+            result = super()._complete_oldest()
+        self.profile_stats["completed_reductions"] += 1
+        return result
 
     def _profile_gather(self, phase, hook, layer, hook_input):
         if not self.measure_gathers:
@@ -244,28 +294,33 @@ def write_accounting(output, result):
         lines.append(f"Measured steady-state peak allocated memory (maximum across ranks): {peak / 2**30:.4f} GiB.\n")
     lines.extend([
         "Phase samples in GiB (CUDA allocated is unavailable on CPU):\n",
-        "| Rank | Phase | Allocated | Masters | Gathered | Gradients | Adam states | Communication buffers |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Rank | Phase | Allocated | Masters | Gathered | Gradients | Adam states | Communication buffers | Staged gradients (subset) | Pending count |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     columns = ("allocated_bytes", "master_weights_bytes", "gathered_weights_bytes", "gradients_bytes",
-               "optimizer_states_bytes", "communication_buffers_bytes")
+               "optimizer_states_bytes", "communication_buffers_bytes", "staged_gradients_bytes")
     for row in rows:
         values = [f"{row[key] / 2**30:.4f}" if row.get(key) is not None else "n/a" for key in columns]
-        lines.append(f"| {row['rank']} | {row['phase']} | " + " | ".join(values) + " |")
+        lines.append(f"| {row['rank']} | {row['phase']} | " + " | ".join(values) + f" | {row.get('pending_reductions', 'n/a')} |")
     lines.append("")
     lines.extend([
         f"Ideal saving from optimizer-state sharding to FSDP: {prediction['ideal_saving_vs_optimizer_sharded_bytes'] / 2**30:.4f} GiB/rank.\n",
         "Measured CUDA peaks are in timings.json; per-rank phase samples and storage categories are in memory.csv. "
         "Phase peaks are cumulative across the separate accounting update. Initialization has a separate peak. "
         "CPU runs have no CUDA memory measurements.\n",
-        "The current student FSDP releases full-weight storage after forward, then gathers again before backward. "
-        "Backward-gathered weights and full FP32 reduce-scatter inputs remain allocated until finish. "
-        "After-forward gathered storage should be zero, but the backward peak can remain high. "
+        "The current student FSDP releases full-weight storage after forward and after each layer's input and weight gradients are ready. "
+        "Both after-forward and after-backward gathered storage should be zero. "
+        "Completed local gradients in state.reduced_grad are included in gradients_bytes; staged_gradients_bytes is a subset, not extra memory. "
+        "Communication buffers include the inputs/outputs of the bounded pending queue. "
+        "finish_gradient_synchronization drains that queue and installs the staged gradients for the optimizer. "
         "Model construction initially allocates full FP32 weights.\n",
         "With --profile-layers, all_gather_path keys are forward/<layer> and backward/<layer>. "
         "Their timings include storage allocation, dtype conversion and gather dependencies, not isolated NCCL time. "
         "NVTX ranges describe CPU launches; inspect correlated CUDA streams to establish whether communication is hidden. "
         "The current gather hook waits just before each layer; it has no explicit forward prefetch.\n",
+        "gradient_reduction_wait/{all_reduce,reduce_scatter} ranges include the queue-drain stream synchronization. "
+        "These waits may occur inside backward as well as in the final synchronization phase. "
+        "weight_reshard/backward/<layer> marks the CPU-side storage release request; profile_stats records release counts and queue occupancy.\n",
     ])
     (output / "report.md").write_text("\n".join(lines))
 
@@ -277,7 +332,8 @@ def run(args, device, rank, world_size):
     config.update(world_size=world_size, local_batch_size=args.global_batch_size // world_size,
                   batch_size=args.global_batch_size // world_size, dtype="float32", mixed_precision=args.compute_dtype != "float32",
                   implementation=f"accounting_{args.strategy}", nsys_profile=os.environ.get("CS336_NSYS_PROFILE") == "1",
-                  fsdp_weight_lifecycle="reshard_after_forward" if args.strategy == "fsdp" else None,
+                  fsdp_weight_lifecycle="reshard_after_forward_and_backward" if args.strategy == "fsdp" else None,
+                  fsdp_max_pending=args.max_pending if args.strategy == "fsdp" else None,
                   allocator_conf=os.environ.get("PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")))
     if rank == 0:
         if (output / "config.json").exists():
@@ -296,9 +352,13 @@ def run(args, device, rank, world_size):
         compute_dtype = DTYPES[args.compute_dtype]
         if args.strategy == "fsdp":
             model = ProfiledFSDP(module, compute_dtype=compute_dtype)
+            model.max_pending = args.max_pending
             model.layer_names = {layer: name for name, layer in module.named_modules()}
+            model.parameter_names = {parameter: name for name, parameter in module.named_parameters()}
+            model.parameter_layer_names = {state.parameter: model.layer_names[layer] for layer, state in model.weight_states.items()}
             model.measure_gathers = False
             model.gather_records = []
+            model.profile_stats = {"max_pending_observed": 0, "completed_reductions": 0, "backward_weight_releases": {}}
         else:
             model = DDP(module)
         optimizer = (ShardedOptimizer(model.parameters(), AdamW, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -354,7 +414,8 @@ def run(args, device, rank, world_size):
             raise FloatingPointError("Nonfinite loss; check precision and learning rate")
         rank_result = {"rank": rank, "samples_ms": samples, "memory_phases": phases,
                        "measured_memory": measured_memory, "final_local_loss": loss.item(),
-                       "all_gather_path": {name: summarize(values) for name, values in gathers.items()}}
+                       "all_gather_path": {name: summarize(values) for name, values in gathers.items()},
+                       "profile_stats": model.profile_stats if isinstance(model, ProfiledFSDP) and args.profile_layers else None}
         write_json(output / f"rank-{rank}.json", rank_result)
         ranks = [None] * world_size
         dist.all_gather_object(ranks, rank_result)

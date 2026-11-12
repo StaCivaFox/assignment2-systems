@@ -92,7 +92,9 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """
     Code to run after the backward pass is completed, but before we take
-    an optimizer step.
+    an optimizer step. Drain the remaining reductions and install the completed
+    state.reduced_grad shards as parameter.grad for the optimizer. Reductions
+    already completed during backward must not be averaged a second time.
 
     Args:
         fsdp_model: torch.nn.Module
@@ -115,8 +117,9 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    # Call on every rank, after synchronization/optimizer.step(). Gather the
-    # FP32 master shards for comparison without changing the model's parameters.
+    # Call on every rank, after fsdp_on_after_backward()/optimizer.step(). Gather
+    # FP32 master shards independently of full_buffer and reduced_grad, so this
+    # inspection neither unshards parameters nor drains/changes the pending queue.
     full_params = {}
     for name, parameter in fsdp_model.module.named_parameters():
         state = fsdp_model.state_by_parameter.get(parameter)

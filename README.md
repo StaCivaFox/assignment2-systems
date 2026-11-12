@@ -837,13 +837,17 @@ such as `fsdp-float32-accounting/` containing:
   `all_gather_path` timings keyed by `forward/<layer>` and `backward/<layer>`.
 - `config.json`, `stdout.log`: configuration and execution details. The run root
   also contains `summary.csv`, `environment.json`, and `source.zip`.
-  Current FSDP runs record `fsdp_weight_lifecycle: reshard_after_forward`.
+  Current FSDP runs record `fsdp_weight_lifecycle: reshard_after_forward_and_backward`
+  and `fsdp_max_pending`. Profiled rank JSON files also include `profile_stats`
+  with maximum observed queue length, completed reduction count, and backward
+  weight-release counts per layer.
 
 Use the `max_rank_step` row in `summary.csv` to compare training step times: it
 takes the slower rank for each paired update, then summarizes those times.
 `mean_ms` and `std_ms` include forward, backward, gradient synchronization, and
 the optimizer update; warm-up and the preceding inter-rank barrier are excluded.
-Timing runs synchronize CUDA only at step boundaries. The memory phase samples
+The benchmark adds CUDA synchronization at step boundaries; FSDP's own queue
+drains may also synchronize inside backward. The memory phase samples
 come from **one additional diagnostic update** after timing; its intermediate
 device synchronizations are excluded from the timing samples. Do not use Nsight
 runs as your final throughput measurements.
@@ -858,7 +862,7 @@ retained before the wrapper's `finish_gradient_synchronization()` releases them.
 | `after_initialization` | Masters after wrapping; Adam moments have not been created yet. |
 | `after_warmup_zero_grad` | Persistent masters and initialized Adam moments, with gradients cleared. |
 | `after_forward` | Live activations; FSDP's gathered-weight storage has been released. |
-| `after_backward_before_sync` | Backward-gathered weights, full gradients, and retained reduction buffers before your finish method releases them. |
+| `after_backward_before_sync` | Gathered weights released; completed local gradients staged in WeightState and a bounded number of pending reduction buffers. |
 | `before_optimizer` | Gathered weights released and local gradients installed for FSDP. |
 | `after_optimizer` | Updated parameters and initialized optimizer state. |
 
@@ -871,6 +875,13 @@ use separate measurement windows. `unattributed_allocated_bytes` is the remainin
 allocated memory after counted tensor storages; it includes activations, inputs,
 and other allocations, so it is not an exact activation-size measurement. CUDA
 memory fields are unavailable for CPU runs.
+
+`gradients_bytes` includes both `parameter.grad` and completed local gradients in
+`state.reduced_grad`. `staged_gradients_bytes` reports the latter as a **subset**
+of `gradients_bytes`; do not add it again to the storage total. Outputs still in
+the pending queue are counted under communication buffers until staged/installed.
+`pending_reductions` is a count, not a byte measurement. Before the optimizer,
+both the staged-gradient count in bytes and pending queue length should be zero.
 
 For part (a), let P be the full parameter count and W the number of ranks. With
 FP32 weights, gradients, and two Adam moments, the balanced ideal per rank is:
@@ -891,18 +902,33 @@ about **12.69 GiB additional ideal saving** versus optimizer-state sharding.
 These are model-state estimates, not total peak-memory predictions: activations,
 temporary allocations, and communication buffers also contribute to the peak.
 
-Your current implementation releases gathered-weight storage after forward and
-gathers weights again before backward. It keeps the backward-gathered weights,
-full parameter gradients, and padded FP32 reduce-scatter inputs until
-`finish_gradient_synchronization()`. Expect `gathered_weights_bytes` to be zero
-after forward, grow to a full model's compute-weight size after backward, and
-drop again at `before_optimizer`. Storage accounting uses allocated storage bytes,
-so retaining a full-weight tensor object with zero-byte storage contributes zero.
-Compared with the earlier retain-through-backward implementation, after-forward
-memory should fall, but the overall peak may remain similar because backward
-still retains these tensors together. The extra backward gathers can also
-increase step time. Use a new run name, such as `fsdp-reshard-forward-fp32`, to
-preserve the previous measurements and compare identical precision and workloads.
+Your current implementation releases gathered-weight storage after forward,
+gathers again before backward, and releases each layer's weights once both its
+input-gradient and weight-gradient conditions are satisfied. It drops the
+original full gradient after preparing the reduction input and bounds the number
+of pending reductions. Expect `gathered_weights_bytes` to be zero at both
+`after_forward` and `after_backward_before_sync`. Completed local gradients remain
+in `state.reduced_grad` until the finish method installs them in `parameter.grad`.
+Storage accounting uses allocated storage bytes, so a retained full-weight tensor
+object with zero-byte storage contributes zero. The backward peak should decrease
+relative to the previous version that retained all gathered weights and gradient
+buffers; activations and per-layer temporaries may become the dominant peak.
+
+The benchmark's `--max-pending` option sets the FSDP queue limit (default 2).
+Through Modal, pass it in `--extra-args`. For example:
+
+```sh
+modal run modal_app.py::fsdp_benchmark \
+    --gpu H100 --strategies fsdp --compute-dtype float32 \
+    --extra-args '--max-pending 2' --run-name fsdp-early-release-h100
+```
+
+Try a separate run with `--max-pending 1` to compare memory and step time. The
+current `_complete_oldest()` explicitly synchronizes the CUDA stream, so limiting
+the queue can introduce waits **inside backward**. A shorter final synchronization
+phase therefore does not imply less total communication overhead. Use complete
+step times and the Nsight timeline to assess the tradeoff. Preserve old runs and
+compare on matching GPUs, precision, batch size, and context length.
 BF16 halves the gathered-weight payload but does not halve every memory category.
 The phase table makes the later comparison with a version that releases each
 layer's weights and gradient buffers as soon as possible measurable. Keep the
@@ -933,6 +959,11 @@ results/modal/fsdp-xl-nsys/fsdp-float32-accounting/trace.nsys-rep
    `weight_reshard/forward/<layer name>` labels the subsequent storage release.
    In the `backward` section, find `weight_all_gather/backward/<layer name>` for
    the newly added gathers. The forward compute range ends before resharding.
+   `backward_input_ready/<layer>` and `gradient_ready/<parameter>` show the two
+   callbacks that can trigger release. `weight_reshard/backward/<layer>` is an
+   instant marker when the hook requests the release, not a GPU completion event.
+   `gradient_reduction_wait/all_reduce` and `gradient_reduction_wait/reduce_scatter`
+   show queue drains, including the implementation's CPU wait for CUDA completion.
 3. Measure a gather's GPU duration and whether it overlaps useful computation
    from an earlier layer. Inspect whether it leaves an exposed wait before the
    target layer's first compute kernel. CPU NVTX ranges alone do not demonstrate
@@ -952,8 +983,10 @@ results/modal/fsdp-xl-nsys/fsdp-float32-accounting/trace.nsys-rep
 The current implementation performs two gathers per managed layer per update:
 one for forward and one for backward. Both are instrumented. Each phase/layer
 entry in `all_gather_path` should contain `steps` samples for this model, where
-each managed layer is used once per update. Early release of backward weights
-and gradient buffers is the next memory optimization.
+each managed layer is used once per update. `profile_stats` should likewise show
+`steps` backward weight releases for every managed layer and a maximum pending
+count no greater than `fsdp_max_pending`. Improving overlap while keeping the
+queue's memory bounded is the next optimization.
 
 For a local two-process CPU pipeline check (no GPU memory measurements):
 
