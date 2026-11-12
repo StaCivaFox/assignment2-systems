@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import torch
-from cs336_systems import flash_attention, ddp
+import torch.distributed as dist
+from cs336_systems import flash_attention, ddp, fsdp, sharded_optimizer
 
 
 
@@ -52,7 +53,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDP(module)
-    return ddp.FlatDDP(module)
+    return ddp.DDP(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -67,7 +68,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    return ddp_model.synchronize_gradients()
+    return ddp_model.finish_gradient_synchronization()
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
@@ -85,8 +86,7 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
     Returns:
         Instance of an FSDP class.
     """
-    # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    return fsdp.FSDP(module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -100,14 +100,14 @@ def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.O
         optimizer: torch.optim.Optimizer
             Optimizer being used with the FSDP-wrapped model.
     """
-    # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    return fsdp_model.finish_gradient_synchronization()
 
 
+@torch.no_grad()
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """
     All-gather sharded parameters from the FSDP model to reconstruct full
-    parameter tensors. Replicated parameters are returned as-is.
+    parameter tensors. Replicated parameters are returned as detached copies.
 
     Args:
         fsdp_model: torch.nn.Module
@@ -115,7 +115,28 @@ def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tens
     Returns:
         State dictionary mapping parameter names to full (unsharded) tensors.
     """
-    raise NotImplementedError
+    # Call on every rank, after synchronization/optimizer.step(). Gather the
+    # FP32 master shards for comparison without changing the model's parameters.
+    full_params = {}
+    for name, parameter in fsdp_model.module.named_parameters():
+        state = fsdp_model.state_by_parameter.get(parameter)
+        if state is None:
+            full_params[name] = parameter.detach().clone()
+        else:
+            # unshard_weight() is for computation: it changes parameter.data
+            # and fills the reusable buffer in compute_dtype. Comparisons need
+            # the FP32 master values without changing the model's lifecycle.
+            shard = state.local_shard.detach().contiguous()
+            full_padded = torch.empty(
+                state.info.shard_numel * state.info.world_size,
+                dtype=shard.dtype,
+                device=shard.device,
+            )
+            dist.all_gather_into_tensor(full_padded, shard)
+            full_params[name] = full_padded[:state.info.original_numel].view(
+                state.info.original_shape
+            )
+    return full_params
 
 
 def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
@@ -134,4 +155,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return sharded_optimizer.ShardedOptimizer(params, optimizer_cls, **kwargs)

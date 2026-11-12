@@ -7,27 +7,27 @@ class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         super().__init__()
         std = math.sqrt(2 / (out_features + in_features))
-        self.weights = nn.Parameter(
+        self.weight = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(out_features, in_features, device=device, dtype=dtype), 0.0, std, -3 * std, 3 * std), 
             requires_grad=True
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return einsum(x, self.weights, "... d_in, d_out d_in -> ... d_out")
+        return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
 
 class Embedding(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
         super().__init__()
-        self.weights = nn.Parameter(
+        self.weight = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype), 0.0, 1.0, -3, 3), 
             requires_grad=True
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         # batch_size sequence_length -> batch_size sequence_length embedding_dim
-        return self.weights[token_ids, :]
+        return self.weight[token_ids, :]
 
-class rmsnorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
         self.weight = nn.Parameter(
@@ -138,11 +138,11 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, d_ff: int, positional_encoder: RotaryPositionalEmbedding | None = None):
         super().__init__()
         # rms norm
-        self.norm1 = rmsnorm(d_model=d_model)
+        self.norm1 = RMSNorm(d_model=d_model)
         # multi-head attention
         self.mha = CausalMultiheadSelfAttention(d_model=d_model, num_heads=num_heads, positional_encoder=positional_encoder)
         # rms norm
-        self.norm2 = rmsnorm(d_model=d_model)
+        self.norm2 = RMSNorm(d_model=d_model)
         # FFN
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
 
@@ -170,7 +170,7 @@ class TransformerLM(nn.Module):
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, positional_encoder=self.positional_encoder) for _ in range(num_layers)
         ])
-        self.norm = rmsnorm(d_model=d_model)
+        self.norm = RMSNorm(d_model=d_model)
         self.output_embedding = Linear(d_model, vocab_size)
 
     def forward(self, x: torch.Tensor):

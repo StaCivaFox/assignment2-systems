@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from cs336_systems.ddp_train import TokenBatches, parse_args, summarize_ranks
-from cs336_systems.modal_runner import ddp_jobs, write_summary
+from cs336_systems.modal_runner import DDP_NSYS_ARGS, command_argv, ddp_jobs, write_summary
 
 
 TINY = ["--d-model", "8", "--d-ff", "16", "--num-layers", "1", "--num-heads", "2",
@@ -37,6 +37,16 @@ def test_paired_rank_aggregation_and_fraction():
     assert fraction == pytest.approx(0.2)
 
 
+def test_overlap_reports_tail_without_calling_it_total_communication():
+    ranks = [{"samples_ms": {"step": [10, 20], "backward_and_sync": [6, 12], "gradient_sync_tail": [1, 2]}},
+             {"samples_ms": {"step": [20, 30], "backward_and_sync": [12, 18], "gradient_sync_tail": [2, 3]}}]
+    timings, fraction = summarize_ranks(ranks)
+    assert timings["backward_and_sync"]["samples_ms"] == [9, 15]
+    assert timings["gradient_sync_tail"]["samples_ms"] == [1.5, 2.5]
+    assert "communication" not in timings
+    assert fraction == pytest.approx(0.1)
+
+
 def test_corpus_shards_are_disjoint_and_next_token_aligned(tmp_path):
     path = tmp_path / "tokens.npy"
     np.save(path, np.arange(100, dtype=np.int32))
@@ -62,8 +72,18 @@ def test_modal_ddp_plan_defaults_and_validation():
     assert all(job["allocator_conf"] == "expandable_segments:True" for job in jobs)
     assert [job["name"] for job in jobs] == ["naive-ddp-benchmark", "flat-ddp-benchmark"]
     assert [job["argv"][job["argv"].index("--wrapper") + 1] for job in jobs] == ["naive", "flat"]
+    jobs = ddp_jobs(wrapper="all")
+    assert [job["name"] for job in jobs] == ["naive-ddp-benchmark", "flat-ddp-benchmark", "overlap-ddp-benchmark"]
+    assert ddp_jobs("train", warmup_steps=0, wrapper="overlap")[0]["argv"].count("overlap") == 1
+    command = command_argv(jobs[-1]["argv"], Path("/tmp/profile"), True, DDP_NSYS_ARGS)
+    assert command[:2] == ["nsys", "profile"]
+    assert "--nvtx-capture=ddp_measurement" in command
+    assert "--wait=all" in command
+    assert "torch.distributed.run" in command
     with pytest.raises(ValueError):
         ddp_jobs("train", warmup_steps=0, wrapper="both")
+    with pytest.raises(ValueError):
+        ddp_jobs("train", warmup_steps=0, wrapper="all")
     with pytest.raises(ValueError):
         ddp_jobs(extra_args="--wrapper=flat")
     with pytest.raises(ValueError):
@@ -75,7 +95,7 @@ def test_modal_ddp_plan_defaults_and_validation():
 def test_two_rank_benchmark_and_modal_summary(tmp_path):
     checkpoints = []
     records = []
-    for wrapper in ("naive", "flat"):
+    for wrapper in ("naive", "flat", "overlap"):
         destination = tmp_path / wrapper
         launch("ddp_benchmark", destination, "--wrapper", wrapper, "--warmup-steps", "1", "--steps", "2", "--save-checkpoint")
         result = json.loads((destination / "timings.json").read_text())
@@ -86,23 +106,30 @@ def test_two_rank_benchmark_and_modal_summary(tmp_path):
         assert result["config"]["global_batch_size"] == 4
         assert result["config"]["local_batch_size"] == 2
         assert result["gradient_all_reduce_calls_per_step"] == (1 if wrapper == "flat" else result["gradient_tensor_count"])
+        sync_phase = "gradient_sync_tail" if wrapper == "overlap" else "communication"
         for rank in result["ranks"]:
             assert len(rank["samples_ms"]["step"]) == 2
-            assert all(total >= communication > 0 for total, communication in zip(rank["samples_ms"]["step"], rank["samples_ms"]["communication"]))
-        assert 0 < result["communication_percent"] <= 100
+            assert all(total >= communication > 0 for total, communication in zip(rank["samples_ms"]["step"], rank["samples_ms"][sync_phase]))
+            assert all(total >= tail for total, tail in zip(rank["samples_ms"]["backward_and_sync"], rank["samples_ms"][sync_phase]))
+        assert 0 < result[f"{sync_phase}_percent"] <= 100
+        if wrapper == "overlap":
+            assert "communication" not in result["timings"]
+            assert "communication_percent" not in result
         log = [json.loads(line) for line in (destination / "train.jsonl").read_text().splitlines()]
         assert log[-1]["optimizer_updates_including_warmup"] == 3
         checkpoints.append(torch.load(destination / "checkpoint.pt", weights_only=True))
         records.append({"name": wrapper, "status": "success", "returncode": 0})
         assert wrapper in (destination / "ddp_summary.csv").read_text()
         assert (destination / "report.md").read_text().startswith(f"{wrapper.capitalize()} DDP")
-    # Both selectable wrappers must produce equivalent actual model updates.
-    for name, expected in checkpoints[0]["model"].items():
-        torch.testing.assert_close(checkpoints[1]["model"][name], expected, atol=1e-6, rtol=1e-5)
+    # Communication placement must preserve actual updates over multiple steps.
+    for checkpoint in checkpoints[1:]:
+        for name, expected in checkpoints[0]["model"].items():
+            torch.testing.assert_close(checkpoint["model"][name], expected, atol=1e-6, rtol=1e-5)
     write_summary(tmp_path, records)
     summary = (tmp_path / "summary.csv").read_text()
     assert "communication_percent" in summary
-    assert "naive_ddp" in summary and "flat_ddp" in summary
+    assert all(f"{wrapper}_ddp" in summary for wrapper in ("naive", "flat", "overlap"))
+    assert "gradient_sync_tail_percent" in summary
 
 
 def test_two_rank_training_resume_matches_uninterrupted_updates(tmp_path):

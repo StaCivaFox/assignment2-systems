@@ -1,4 +1,4 @@
-"""Train the assignment-1 Transformer with the student's naive or flat DDP wrapper.
+"""Train the assignment-1 Transformer with naive, flat, or overlapping DDP.
 
 Launch with torchrun (one process per GPU), or use --backend gloo on CPU.
 The companion ddp_benchmark module uses the same optimizer-step implementation.
@@ -24,7 +24,7 @@ from cs336_basics.model import TransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 from cs336_systems.benchmark import BenchmarkConfig, MODEL_SIZES, nvtx_range, summarize, synchronize
-from cs336_systems.ddp import FlatDDP, NaiveDDP
+from cs336_systems.ddp import DDP, FlatDDP, NaiveDDP
 from cs336_systems.distributed_communication_benchmark import write_json
 from cs336_systems.modal_runner import run_name
 
@@ -32,7 +32,7 @@ from cs336_systems.modal_runner import run_name
 def parse_args(argv=None, *, benchmark=False):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model-size", choices=MODEL_SIZES, default="xl" if benchmark else "small")
-    parser.add_argument("--wrapper", choices=("naive", "flat"), default="naive", help="individual gradient all-reduces or one packed all-reduce")
+    parser.add_argument("--wrapper", choices=("naive", "flat", "overlap"), default="naive", help="post-backward individual/packed reductions, or individual reductions during backward")
     for name in ("d-model", "d-ff", "num-layers", "num-heads"):
         parser.add_argument(f"--{name}", type=int)
     parser.add_argument("--vocab-size", type=int, default=10_000)
@@ -111,7 +111,15 @@ class TokenBatches:
 
 
 def train_step(model, optimizer, inputs, targets, device, *, mixed_precision=False, max_grad_norm=0.0, timed=False):
-    """A full update. Synchronize timing boundaries only in benchmark mode."""
+    """Time full updates without inserting device barriers inside backward/sync.
+
+    CUDA events measure the backward+sync interval and the exposed sync tail on
+    the compute stream. Recording an event does not wait for outstanding work.
+    CPU/Gloo uses wall-clock intervals because its computation is synchronous.
+    """
+    overlap = isinstance(model, DDP)
+    sync_phase = "gradient_sync_tail" if overlap else "communication"
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3)] if timed and device.type == "cuda" else None
     if timed:
         synchronize(device)
     start = time.perf_counter()
@@ -120,16 +128,23 @@ def train_step(model, optimizer, inputs, targets, device, *, mixed_precision=Fal
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if mixed_precision else nullcontext():
             logits = model(inputs)
         loss = cross_entropy(logits.float(), targets)
+    backward_start = time.perf_counter()
+    if events:
+        events[0].record()
     with nvtx_range("backward", device):
         loss.backward()
-    if timed:
-        # Exclude unfinished backprop kernels from the communication interval.
-        synchronize(device)
+    # Do not synchronize here: communication launched by hooks must be able to
+    # overlap backward. This event reaches the GPU after compute-stream backward.
+    if events:
+        events[1].record()
     communication_start = time.perf_counter()
-    with nvtx_range("gradient_synchronization", device):
-        model.synchronize_gradients()
-    if timed:
-        synchronize(device)
+    with nvtx_range("finish_gradient_synchronization" if overlap else "gradient_synchronization", device):
+        if overlap:
+            model.finish_gradient_synchronization()
+        else:
+            model.synchronize_gradients()
+    if events:
+        events[2].record()
     communication_end = time.perf_counter()
     with nvtx_range("optimizer", device):
         if max_grad_norm > 0:
@@ -138,21 +153,25 @@ def train_step(model, optimizer, inputs, targets, device, *, mixed_precision=Fal
     if timed:
         synchronize(device)
     end = time.perf_counter()
-    timing = {
-        "step": (end - start) * 1000,
-        "communication": (communication_end - communication_start) * 1000,
-    } if timed else {}
+    timing = {}
+    if timed:
+        timing = {
+            "step": (end - start) * 1000,
+            "backward_and_sync": events[0].elapsed_time(events[2]) if events else (communication_end - backward_start) * 1000,
+            sync_phase: events[1].elapsed_time(events[2]) if events else (communication_end - communication_start) * 1000,
+        }
     return loss.detach(), timing
 
 
 def summarize_ranks(ranks):
     """Mean-rank step/communication times; paired, time-weighted fraction."""
     timings = {}
-    for phase in ("step", "communication"):
+    for phase in ranks[0]["samples_ms"]:
         by_rank = [rank["samples_ms"][phase] for rank in ranks]
         timings[phase] = summarize([statistics.mean(values) for values in zip(*by_rank, strict=True)])
     timings["max_rank_step"] = summarize([max(values) for values in zip(*(rank["samples_ms"]["step"] for rank in ranks), strict=True)])
-    fraction = timings["communication"]["mean_ms"] / timings["step"]["mean_ms"]
+    sync_phase = "gradient_sync_tail" if "gradient_sync_tail" in timings else "communication"
+    fraction = timings[sync_phase]["mean_ms"] / timings["step"]["mean_ms"]
     return timings, fraction
 
 
@@ -180,6 +199,9 @@ def run(args, device, rank, world_size):
     local_batch = args.global_batch_size // world_size
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config.update(world_size=world_size, local_batch_size=local_batch, batch_size=local_batch, dtype="float32", implementation=f"{args.wrapper}_ddp")
+    sync_phase = "gradient_sync_tail" if args.wrapper == "overlap" else "communication"
+    config.update(sync_phase=sync_phase, timing_method="cuda_events_and_wall_step" if device.type == "cuda" else "wall_clock",
+                  nsys_profile=os.environ.get("CS336_NSYS_PROFILE") == "1")
     config["allocator_conf"] = os.environ.get("PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
     config["train_data"] = str(args.train_data.resolve()) if args.train_data else None
     output = args.output_dir
@@ -187,7 +209,7 @@ def run(args, device, rank, world_size):
         if (output / "config.json").exists():
             raise FileExistsError(f"{output} already contains a run; choose a new output-dir")
         write_json(output / "config.json", config)
-    samples = {"step": [], "communication": []}
+    samples = {name: [] for name in ("step", "backward_and_sync", sync_phase)}
     phase = "initialization"
     try:
         torch.manual_seed(args.seed + rank)
@@ -195,7 +217,7 @@ def run(args, device, rank, world_size):
             d_model=args.d_model, d_ff=args.d_ff, num_layers=args.num_layers, num_heads=args.num_heads,
             vocab_size=args.vocab_size, context_length=args.context_length, rope_theta=args.rope_theta,
         ).to(device)
-        wrapper_class = {"naive": NaiveDDP, "flat": FlatDDP}[args.wrapper]
+        wrapper_class = {"naive": NaiveDDP, "flat": FlatDDP, "overlap": DDP}[args.wrapper]
         model = wrapper_class(model)
         model.train()
         optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -214,36 +236,46 @@ def run(args, device, rank, world_size):
                 torch.cuda.reset_peak_memory_stats(device)
         phase = "measurement" if args.benchmark else "training"
         loss = None
-        for update in range(start_update, args.steps):
-            inputs, targets = fixed_batch if args.benchmark else batches.get(update)
+        # Only rank 0 opens the named capture range. Barriers inside it keep all
+        # workers' measured GPU activity inside one process-tree Nsight capture.
+        capture_name = "ddp_measurement" if rank == 0 else f"ddp_worker_rank_{rank}"
+        with nvtx_range(capture_name, device):
             if args.benchmark:
-                # Align the start of steps; don't insert a barrier before the
-                # all-reduces, whose natural wait for slower ranks is real cost.
+                dist.barrier()
+            for update in range(start_update, args.steps):
+                inputs, targets = fixed_batch if args.benchmark else batches.get(update)
+                if args.benchmark:
+                    # Align steps; no barrier between backward and gradient sync.
+                    dist.barrier()
+                    synchronize(device)
+                with nvtx_range(f"step_{update + 1}/rank_{rank}/{args.wrapper}", device):
+                    loss, timing = train_step(
+                        model, optimizer, inputs, targets, device, mixed_precision=args.mixed_precision,
+                        max_grad_norm=args.max_grad_norm, timed=args.benchmark,
+                    )
+                for name, value in timing.items():
+                    samples[name].append(value)
+                # Reporting collectives and disk IO are outside benchmark timing.
+                if (update + 1) % args.log_every == 0 or update + 1 == args.steps:
+                    with nvtx_range("loss_logging", device):
+                        mean_loss = loss.clone()
+                        dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
+                        mean_loss.div_(world_size)
+                        value = mean_loss.item()
+                    if not math.isfinite(value):
+                        raise FloatingPointError(f"nonfinite loss at update {update + 1}")
+                    if rank == 0:
+                        row = {"update": update + 1, "optimizer_updates_including_warmup": update + 1 + args.warmup_steps, "loss": value}
+                        with (output / "train.jsonl").open("a") as stream:
+                            stream.write(json.dumps(row) + "\n")
+                        print(f"update={update + 1} global_mean_loss={value:.6f}", flush=True)
+                if args.checkpoint_every and (update + 1) % args.checkpoint_every == 0:
+                    if rank == 0:
+                        save_checkpoint(output / "checkpoint.pt", model, optimizer, update + 1, config)
+                    dist.barrier()
+            if args.benchmark:
                 dist.barrier()
                 synchronize(device)
-            loss, timing = train_step(
-                model, optimizer, inputs, targets, device, mixed_precision=args.mixed_precision,
-                max_grad_norm=args.max_grad_norm, timed=args.benchmark,
-            )
-            for name, value in timing.items():
-                samples[name].append(value)
-            # Reporting collectives and disk IO are outside benchmark timing.
-            if (update + 1) % args.log_every == 0 or update + 1 == args.steps:
-                mean_loss = loss.clone()
-                dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
-                mean_loss.div_(world_size)
-                value = mean_loss.item()
-                if not math.isfinite(value):
-                    raise FloatingPointError(f"nonfinite loss at update {update + 1}")
-                if rank == 0:
-                    row = {"update": update + 1, "optimizer_updates_including_warmup": update + 1 + args.warmup_steps, "loss": value}
-                    with (output / "train.jsonl").open("a") as stream:
-                        stream.write(json.dumps(row) + "\n")
-                    print(f"update={update + 1} global_mean_loss={value:.6f}", flush=True)
-            if args.checkpoint_every and (update + 1) % args.checkpoint_every == 0:
-                if rank == 0:
-                    save_checkpoint(output / "checkpoint.pt", model, optimizer, update + 1, config)
-                dist.barrier()
 
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         rank_result = {
@@ -266,8 +298,10 @@ def run(args, device, rank, world_size):
                 "memory": {key: max(item[key] for item in ranks) for key in ("peak_allocated_bytes", "peak_reserved_bytes")},
             }
             if args.benchmark:
-                result["timings"], result["communication_fraction"] = summarize_ranks(ranks)
-                result["communication_percent"] = 100 * result["communication_fraction"]
+                result["timings"], sync_fraction = summarize_ranks(ranks)
+                fraction_name = "gradient_sync_tail" if args.wrapper == "overlap" else "communication"
+                result[f"{fraction_name}_fraction"] = sync_fraction
+                result[f"{fraction_name}_percent"] = 100 * sync_fraction
                 result["global_tokens_per_second"] = args.global_batch_size * args.context_length / (result["timings"]["max_rank_step"]["mean_ms"] / 1000)
                 write_json(output / "timings.json", result)
                 table = {
@@ -275,9 +309,11 @@ def run(args, device, rank, world_size):
                     "allocator_conf": config["allocator_conf"],
                     "model_size": args.model_size, "world_size": world_size, "global_batch_size": args.global_batch_size,
                     "local_batch_size": local_batch, "context_length": args.context_length, "mixed_precision": args.mixed_precision,
+                    "nsys_profile": config["nsys_profile"], "timing_method": config["timing_method"],
                     "step_mean_ms": result["timings"]["step"]["mean_ms"], "step_std_ms": result["timings"]["step"]["std_ms"],
-                    "communication_mean_ms": result["timings"]["communication"]["mean_ms"],
-                    "communication_percent": result["communication_percent"], "global_tokens_per_second": result["global_tokens_per_second"],
+                    "backward_and_sync_mean_ms": result["timings"]["backward_and_sync"]["mean_ms"],
+                    f"{sync_phase}_mean_ms": result["timings"][sync_phase]["mean_ms"],
+                    f"{fraction_name}_percent": 100 * sync_fraction, "global_tokens_per_second": result["global_tokens_per_second"],
                 }
                 with (output / "ddp_summary.csv").open("w", newline="") as stream:
                     writer = csv.DictWriter(stream, fieldnames=list(table))
@@ -288,10 +324,15 @@ def run(args, device, rank, world_size):
                     f"Actual model: d_model={args.d_model}, d_ff={args.d_ff}, layers={args.num_layers}, heads={args.num_heads}.\n"
                     f"Allocator configuration: {config['allocator_conf'] or 'default'}.\n"
                     f"Global/local batch {args.global_batch_size}/{local_batch}, context {args.context_length}, FP32 parameters, BF16 autocast={args.mixed_precision}.\n"
-                    f"Mean step: {table['step_mean_ms']:.3f} ms; gradient synchronization: {table['communication_mean_ms']:.3f} ms "
-                    f"({table['communication_percent']:.2f}% of step time).\n"
-                    "Times average ranks per iteration; std summarizes those iteration averages. Communication includes SUM all-reduces, "
-                    "gradient division, packing/copyback for the flat wrapper, launch overhead, and waiting for peers. Step time includes zero_grad, forward/loss, backward, "
+                    f"Mean step: {table['step_mean_ms']:.3f} ms; backward + synchronization: {table['backward_and_sync_mean_ms']:.3f} ms; "
+                    f"{sync_phase}: {table[f'{sync_phase}_mean_ms']:.3f} ms ({100 * sync_fraction:.2f}% of step time).\n"
+                    f"Timing method: {config['timing_method']}; Nsight profiled={config['nsys_profile']}.\n"
+                    "Times average ranks per iteration; std summarizes those iteration averages. CUDA events measure backward/sync intervals on the compute stream, "
+                    "with no device synchronization between backward and the finish call. CPU/Gloo intervals use wall time. "
+                    "For naive/flat, communication includes post-backward reductions, averaging and packing/copyback. "
+                    "For overlap, gradient_sync_tail measures only the remaining compute-stream wait and averaging after backward; "
+                    "it excludes reductions already hidden behind backward and is not total NCCL time. "
+                    "Step time is wall time including zero_grad, forward/loss, backward, "
                     "synchronization, optional clipping, and AdamW; data preparation, barriers, logging and checkpoints are excluded.\n"
                 )
                 (output / "report.md").write_text(report)

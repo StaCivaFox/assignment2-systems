@@ -470,10 +470,10 @@ On a local multi-GPU machine, omit `--backend gloo` and optionally pass
 starts `torchrun` itself. CPU measurements validate the script; use NCCL GPU
 measurements for the assignment results.
 
-## Naive and flat DDP training and benchmarking (sections 5.2 and 5.3.1)
+## DDP training and benchmarking (sections 5.2 and 5.3)
 
 [`cs336_systems/ddp_train.py`](./cs336_systems/ddp_train.py) provides a full
-optimizer-step training loop using your `cs336_systems.ddp.NaiveDDP`, the
+optimizer-step training loop using your DDP wrappers (`NaiveDDP`, `FlatDDP`, or `DDP`), the
 assignment-1 `TransformerLM`, cross-entropy loss, and your AdamW implementation.
 It initializes the process group, assigns one GPU to each worker, splits the
 global batch evenly, averages gradients before clipping/stepping, logs the global
@@ -498,7 +498,8 @@ excluded from timing statistics. The benchmark reuses a preallocated synthetic
 batch on each rank. It performs one all-reduce per parameter gradient, after
 backpropagation, through your wrapper.
 
-Select the implementation with `--wrapper naive` (the default) or `--wrapper flat`.
+Select the implementation with `--wrapper naive` (the default), `--wrapper flat`,
+or `--wrapper overlap` (your hook-based `DDP` class).
 The flat variant uses your `FlatDDP`: pack gradients, run one SUM all-reduce,
 average, and copy the values back. Its entire packing/communication/copyback
 sequence is included in the synchronization timer. Both variants record their
@@ -519,7 +520,7 @@ modal run modal_app.py::ddp_benchmark --wrapper flat --gpu H100 \
 Both jobs use the same model/data seeds and settings, with fresh worker processes
 and optimizer state for each variant. Artifacts appear under
 `naive-ddp-benchmark/` and `flat-ddp-benchmark/`; the run's top-level `summary.csv`
-contains both implementations. `--wrapper naive|flat` also works with the local
+contains both implementations. `--wrapper naive|flat|overlap` also works with the local
 `ddp_benchmark`/`ddp_train` modules and the Modal `ddp_train` entrypoint. Pass it
 directly to the Modal entrypoint, not inside `--extra-args`. The local modules
 accept a single wrapper per invocation. Use the same wrapper when resuming a
@@ -582,21 +583,150 @@ Benchmark artifacts download to
 - `train.jsonl`: global mean loss at reporting intervals.
 
 The total-step interval includes gradient clearing, forward/loss, backward,
-gradient synchronization, optional clipping, and AdamW. CUDA is synchronized
-before measuring communication, after communication, and after the optimizer
-step. The communication interval includes the individual SUM all-reduces,
-gradient averaging, Python/launch overhead, and waiting for peer ranks. The
-pre-step barrier, input preparation, loss logging, and checkpoint writes are
-outside timing. These synchronization boundaries can themselves affect latency.
-No extra barrier is inserted between backward and gradient synchronization.
+gradient synchronization, optional clipping, and AdamW. CUDA is synchronized at
+the step boundaries. CUDA events on the compute stream measure
+`backward_and_sync` and the post-backward synchronization interval; no device
+barrier is inserted between backward and synchronization, or between
+synchronization and the optimizer. CPU/Gloo uses wall-clock phase intervals.
+For naive/flat, `communication` includes reductions, averaging, packing/copyback,
+and exposed scheduling/peer waits. For overlap, `gradient_sync_tail` measures the
+remaining compute-stream wait plus averaging after backward, **not total NCCL
+time**. The pre-step barrier, input preparation, loss logging, and checkpoint
+writes are outside step timing. The previous version used wall-clock
+communication intervals with extra device synchronizations; rerun all variants
+with this version for a consistent comparison.
 
 For each iteration, the primary timings average durations across ranks. Their
 means and population standard deviations summarize the measured iterations.
-`communication_percent = 100 * mean_communication_ms / mean_step_ms`; it uses
+`communication_percent = 100 * mean_communication_ms / mean_step_ms`; overlap
+reports `gradient_sync_tail_percent` instead. Each ratio uses
 the same ranks and iterations in both terms. `max_rank_step` also records the
 slowest rank per iteration and determines global tokens/second. The top-level
-Modal `summary.csv` includes the DDP world size, global batch, and communication
-percentage. GPU performance measurements have to be collected on an actual run.
+Modal `summary.csv` includes the DDP world size, global batch, synchronization
+percentage, timing method, and whether Nsight profiling was enabled. GPU
+performance measurements have to be collected on an actual run.
+
+### Overlapping individual gradients and inspecting Nsight traces (section 5.3.2)
+
+`--wrapper overlap` launches asynchronous per-parameter all-reduces from your
+`DDP` hooks during `loss.backward()`, then calls
+`finish_gradient_synchronization()` before clipping/AdamW. For
+`ddp_overlap_individual_parameters_benchmarking`, first collect timings without
+the profiler. The Modal-only `--wrapper all` runs naive, flat, and overlap
+sequentially on the **same allocated node**, each in fresh worker processes with
+the same seeds and configuration (`both` continues to mean naive + flat):
+
+```sh
+modal run modal_app.py::ddp_benchmark --wrapper all --gpu H200 \
+    --model-size xl --world-size 2 --warmup-steps 5 --steps 10 \
+    --run-name ddp-h200-all
+
+# Or benchmark just the overlap implementation.
+modal run modal_app.py::ddp_benchmark --wrapper overlap --gpu H200 \
+    --run-name ddp-h200-overlap
+```
+
+Compare `step` (or `max_rank_step`) and `backward_and_sync` in the top-level
+`summary.csv`. Each wrapper has its own `<wrapper>-ddp-benchmark/` directory.
+`gradient_sync_tail` can be small even when substantial communication happened
+during backward. It is not comparable to total communication duration or a
+direct measurement of the percentage hidden. Hardware resource contention can
+also slow backward while communication overlaps it, so use **total step time**
+to judge the benefit. Keep GPU type, precision, context, global batch, warm-ups,
+and allocator settings identical across the comparison.
+
+Collect separate, short profiles to inspect overlap. This command produces all
+three reports on one node; naive and overlap are the two required for the visual
+comparison:
+
+```sh
+modal run modal_app.py::ddp_benchmark --wrapper all --gpu H200 \
+    --model-size xl --world-size 2 --warmup-steps 5 --steps 3 \
+    --nsys --run-name ddp-h200-overlap-nsys
+```
+
+Initialization, weight broadcast, and warm-ups are excluded by default. Rank 0
+opens the `ddp_measurement` NVTX capture range after warm-up; barriers inside that
+range keep both workers' measured steps within the capture. Nsight wraps the
+torchrun launcher and traces its worker processes. Each job's `job.json` records
+the exact expanded command, equivalent to:
+
+```sh
+CS336_NSYS_PROFILE=1 nsys profile \
+    --trace=cuda,nvtx,osrt,cublas,cudnn \
+    --sample=none --cpuctxsw=none --wait=all \
+    --capture-range=nvtx --nvtx-capture=ddp_measurement \
+    --capture-range-end=stop \
+    --env-var=NSYS_NVTX_PROFILER_REGISTER_ONLY=0 \
+    --output /path/to/new-profile/trace \
+    .venv/bin/python -u -m torch.distributed.run \
+    --standalone --nnodes=1 --nproc-per-node=2 \
+    -m cs336_systems.ddp_benchmark --backend nccl --wrapper overlap \
+    --model-size xl --warmup-steps 5 --steps 3 \
+    --output-dir /path/to/new-profile
+```
+
+For a local run, create `/path/to/new-profile` first and replace the paths above.
+The `CS336_NSYS_PROFILE` variable marks this manual run as profiled in its JSON
+and CSV outputs; the Modal launcher sets it automatically.
+Run this on a host with two CUDA GPUs and Nsight Systems installed; the Modal
+image already includes Nsight Systems 2025.3.2. `--trace` captures CUDA execution,
+NVTX labels, OS runtime calls, and library calls. CPU sampling/context-switch
+tracing are disabled for container compatibility. `--wait=all` waits for child
+processes, and the capture options restrict collection to measured updates.
+The environment setting enables matching the string ranges used by PyTorch.
+See NVIDIA's [Nsight Systems CLI guide](https://docs.nvidia.com/nsight-systems/UserGuide/).
+Optional extra profiler flags go through `--nsys-args`, for example
+`--nsys-args '--cuda-memory-usage=true'`. Use unprofiled results for timing tables.
+
+Reports download automatically to:
+
+```text
+results/modal/ddp-h200-overlap-nsys/
+    naive-ddp-benchmark/trace.nsys-rep
+    flat-ddp-benchmark/trace.nsys-rep
+    overlap-ddp-benchmark/trace.nsys-rep
+```
+
+To inspect them in the Nsight Systems desktop application:
+
+1. Open the naive and overlap `.nsys-rep` files, for example with **File > Open**
+   on the Windows host. Use a GUI version matching or newer than the collector.
+   The machine opening the reports does not need the Modal GPUs.
+2. Expand the worker processes' **NVTX** and **CUDA** tracks, and the relevant
+   GPU's **CUDA HW** / stream tracks (labels vary by GUI version). Identify
+   `step_2/rank_0/naive` or `step_2/rank_0/overlap`, and zoom into one full update.
+   Check both workers are present; torchrun itself does not run model kernels.
+3. Use `forward_and_loss`, `backward`, `gradient_synchronization` or
+   `finish_gradient_synchronization`, and `optimizer` to identify phases. These
+   are **CPU launch ranges**. Use CUDA launch correlations or GPU-projected NVTX
+   ranges to identify the associated GPU kernels rather than assuming the CPU
+   range endpoints equal GPU completion times.
+4. Find communication kernels by searching `nccl` (names often contain
+   `AllReduce`/`all_reduce`). Search names vary across NCCL versions. Expand the
+   streams so NCCL kernels and backward GEMM/elementwise kernels are visible
+   together for the **same GPU**.
+5. In naive DDP, gradient reduction kernels should follow backward GPU kernels.
+   In overlap DDP, look for NCCL kernels whose horizontal time intervals
+   **intersect backward computation kernels on another stream of that GPU**.
+   Mere adjacency, overlap across different GPUs, or NCCL calls inside a CPU
+   `backward` range do not by themselves demonstrate GPU compute/communication
+   overlap. Optimizer kernels must follow completion of the gradient reductions.
+6. Take one screenshot from each report with the same approximate time scale,
+   a full step, backward compute and NCCL streams, and the labels visible. Show
+   the serialized reduction tail in naive DDP and intersecting kernel intervals
+   in overlap DDP. Use these with the unprofiled step times in the write-up.
+
+The trace also contains small NCCL operations for step-alignment barriers and
+`loss_logging`; those are outside the measured update and should not be counted
+as parameter-gradient communication. If compute and NCCL remain serialized,
+check the timeline for unexpected synchronizations and verify that the hooks
+launch with `async_op=True` and wait only in the finish method. Actual overlap
+depends on GPU resource availability and must be established from the trace.
+
+For a terminal summary, run `nsys stats --report cuda_gpu_kern_sum trace.nsys-rep`.
+This helps locate kernel names, but summing kernel durations does not prove
+overlap or give elapsed communication time because kernels may run concurrently.
 
 For training on Modal, use:
 
@@ -642,6 +772,203 @@ Periodic checkpoints replace `checkpoint.pt` atomically. Benchmark checkpointing
 is off by default. These scripts use the PyTorch
 [distributed communication](https://docs.pytorch.org/docs/2.11/distributed.html)
 and [torchrun](https://docs.pytorch.org/docs/2.11/elastic/run.html) interfaces.
+
+## FSDP accounting and all-gather profiling (section 7)
+
+[`cs336_systems/fsdp_benchmark.py`](./cs336_systems/fsdp_benchmark.py) implements
+the measurements for `fsdp_accounting`. It uses your `FSDP`, `DDP`, and
+`ShardedOptimizer` implementations with the same model, data seeds, global
+batch, and AdamW settings. The three strategies are:
+
+| Strategy | Weights | Gradients for the optimizer | Adam moments |
+| --- | --- | --- | --- |
+| `ddp` | Replicated | Replicated | Replicated |
+| `optimizer_sharded` | Replicated | Replicated | Owned by one rank per parameter |
+| `fsdp` | Sharded for Linear/Embedding | Sharded for Linear/Embedding | Sharded for Linear/Embedding |
+
+FSDP keeps normalization parameters replicated. The baseline DDP wrapper uses
+your overlapping gradient synchronization. `optimizer_sharded` combines that
+same DDP wrapper with your optimizer wrapper.
+
+Start with an FP32 comparison on two H200 GPUs. The jobs run sequentially on the
+same allocation in fresh processes:
+
+```sh
+modal run modal_app.py::fsdp_benchmark \
+    --gpu H200 --model-size xl --world-size 2 \
+    --strategies ddp,optimizer_sharded,fsdp \
+    --compute-dtype float32 --warmup-steps 5 --steps 10 \
+    --run-name fsdp-accounting-fp32
+```
+
+Defaults are context length 512, global batch size 4 (2 per rank), and vocabulary
+size 10000. Override these through, for example,
+`--extra-args '--context-length 512 --global-batch-size 2'`. Keep the same settings
+for every strategy you compare. `--gpu` takes a type such as `H200` or `B200`;
+`--world-size` supplies the count. For a quick pipeline check, use
+`--model-size small --warmup-steps 1 --steps 2` and a new run name.
+
+Then measure mixed precision separately:
+
+```sh
+modal run modal_app.py::fsdp_benchmark \
+    --gpu H200 --strategies fsdp --compute-dtype bfloat16 \
+    --run-name fsdp-accounting-bf16
+```
+
+`--compute-dtype bfloat16` enables autocast and asks FSDP to gather BF16 weights.
+Local master weights and Adam moments stay FP32; your FSDP also constructs FP32
+reduce-scatter buffers and returns FP32 local gradients. DDP uses autocast but
+retains full FP32 parameters and gradient communication. Thus the two mixed
+precision strategies do not have identical communication payloads or necessarily
+identical numerical results. FP16 is also accepted; this benchmark does not add
+gradient scaling, so BF16 is the intended low-precision experiment.
+
+Outputs download to `results/modal/<run-name>/`. Each strategy has a directory
+such as `fsdp-float32-accounting/` containing:
+
+- `report.md`: ideal model-state estimates, measured CUDA peak, and a per-rank
+  memory table in GiB.
+- `memory.csv`: exact byte counts for the phases below. Tensor storage is counted
+  once even when several tensors alias it.
+- `timings.json`: step timing samples, maximum CUDA peaks across ranks, model
+  parameter count, theoretical estimates, and all per-rank results.
+- `rank-0.json`, `rank-1.json`: individual rank samples and, when profiling,
+  `all_gather_path` timings keyed by `forward/<layer>` and `backward/<layer>`.
+- `config.json`, `stdout.log`: configuration and execution details. The run root
+  also contains `summary.csv`, `environment.json`, and `source.zip`.
+  Current FSDP runs record `fsdp_weight_lifecycle: reshard_after_forward`.
+
+Use the `max_rank_step` row in `summary.csv` to compare training step times: it
+takes the slower rank for each paired update, then summarizes those times.
+`mean_ms` and `std_ms` include forward, backward, gradient synchronization, and
+the optimizer update; warm-up and the preceding inter-rank barrier are excluded.
+Timing runs synchronize CUDA only at step boundaries. The memory phase samples
+come from **one additional diagnostic update** after timing; its intermediate
+device synchronizations are excluded from the timing samples. Do not use Nsight
+runs as your final throughput measurements.
+
+The diagnostic synchronization can finish GPU collectives before the
+`after_backward_before_sync` sample. That phase records the buffers still
+retained before the wrapper's `finish_gradient_synchronization()` releases them.
+
+| Memory phase | What to inspect |
+| --- | --- |
+| `after_model_initialization` | Full FP32 model allocation before wrapping; even FSDP constructs the full model initially. |
+| `after_initialization` | Masters after wrapping; Adam moments have not been created yet. |
+| `after_warmup_zero_grad` | Persistent masters and initialized Adam moments, with gradients cleared. |
+| `after_forward` | Live activations; FSDP's gathered-weight storage has been released. |
+| `after_backward_before_sync` | Backward-gathered weights, full gradients, and retained reduction buffers before your finish method releases them. |
+| `before_optimizer` | Gathered weights released and local gradients installed for FSDP. |
+| `after_optimizer` | Updated parameters and initialized optimizer state. |
+
+`allocated_bytes` is live PyTorch CUDA allocation at the sample;
+`reserved_bytes` includes the caching allocator's unused memory.
+`peak_allocated_bytes` in `timings.json` is the maximum during the measured
+updates. In the four diagnostic-update rows, peaks are cumulative from the start
+of that update, not separate maxima for each phase. Initialization and warm-up
+use separate measurement windows. `unattributed_allocated_bytes` is the remaining
+allocated memory after counted tensor storages; it includes activations, inputs,
+and other allocations, so it is not an exact activation-size measurement. CUDA
+memory fields are unavailable for CPU runs.
+
+For part (a), let P be the full parameter count and W the number of ranks. With
+FP32 weights, gradients, and two Adam moments, the balanced ideal per rank is:
+
+```text
+DDP:                       16 * P bytes
+Optimizer-state sharding:   8 * P + 8 * P / W bytes
+FSDP, if all params shard:  16 * P / W bytes
+Additional saving:          8 * P * (1 - 1/W) bytes
+```
+
+The script adjusts the FSDP estimate for replicated normalization parameters:
+`16 * sharded_parameter_count / W + 16 * replicated_parameter_count`.
+It ignores padding and assumes balanced optimizer ownership. For the default XL
+model (3,406,809,600 parameters) on two ranks, the resulting estimates are
+50.77 GiB for DDP, 38.07 GiB for optimizer-state sharding, and 25.38 GiB for FSDP:
+about **12.69 GiB additional ideal saving** versus optimizer-state sharding.
+These are model-state estimates, not total peak-memory predictions: activations,
+temporary allocations, and communication buffers also contribute to the peak.
+
+Your current implementation releases gathered-weight storage after forward and
+gathers weights again before backward. It keeps the backward-gathered weights,
+full parameter gradients, and padded FP32 reduce-scatter inputs until
+`finish_gradient_synchronization()`. Expect `gathered_weights_bytes` to be zero
+after forward, grow to a full model's compute-weight size after backward, and
+drop again at `before_optimizer`. Storage accounting uses allocated storage bytes,
+so retaining a full-weight tensor object with zero-byte storage contributes zero.
+Compared with the earlier retain-through-backward implementation, after-forward
+memory should fall, but the overall peak may remain similar because backward
+still retains these tensors together. The extra backward gathers can also
+increase step time. Use a new run name, such as `fsdp-reshard-forward-fp32`, to
+preserve the previous measurements and compare identical precision and workloads.
+BF16 halves the gathered-weight payload but does not halve every memory category.
+The phase table makes the later comparison with a version that releases each
+layer's weights and gradient buffers as soon as possible measurable. Keep the
+same precision and workload for that comparison.
+
+For part (b), capture three measured XL updates on two GPUs:
+
+```sh
+modal run modal_app.py::fsdp_benchmark \
+    --gpu H200 --model-size xl --world-size 2 --strategies fsdp \
+    --compute-dtype float32 --warmup-steps 5 --steps 3 \
+    --nsys --run-name fsdp-xl-nsys
+```
+
+`--nsys` turns on per-layer instrumentation and captures the `fsdp_measurement`
+NVTX range, after warm-up and before the diagnostic memory update. Both ranks
+are traced. Open this file in Nsight Systems:
+
+```text
+results/modal/fsdp-xl-nsys/fsdp-float32-accounting/trace.nsys-rep
+```
+
+1. Expand each worker's CUDA GPU and individual stream rows, plus its NVTX row.
+   Zoom into one `step_N/rank_R/fsdp` range and its `forward_and_loss` section.
+2. Find `weight_all_gather/forward/<layer name>` and the following
+   `layer_compute/<layer name>` ranges. Correlate their CUDA launches with NCCL
+   all-gather kernels and the embedding/matmul kernels that consume the weights.
+   `weight_reshard/forward/<layer name>` labels the subsequent storage release.
+   In the `backward` section, find `weight_all_gather/backward/<layer name>` for
+   the newly added gathers. The forward compute range ends before resharding.
+3. Measure a gather's GPU duration and whether it overlaps useful computation
+   from an earlier layer. Inspect whether it leaves an exposed wait before the
+   target layer's first compute kernel. CPU NVTX ranges alone do not demonstrate
+   GPU overlap, and a GPU stream wait need not appear as a long CPU wait.
+4. Your current wrapper gathers immediately before each layer, with no explicit
+   prefetch. Expect communication on the forward critical path: the consumer
+   must wait for its weights. The dependency guarantees correctness; the
+   handout's question is whether communication is ready **without delaying**
+   computation. After adding prefetch, look for a layer's gather overlapping
+   earlier-layer compute and completing before its consumer would otherwise run.
+5. Save a screenshot with both communication and compute streams visible, layer
+   names and a readable time scale. Quote representative gather durations and
+   exposed waiting time in your 2–3 sentence answer. `all_gather_path` in the rank
+   JSON files provides supporting CUDA-event timings of the hook, including dtype
+   conversion and dependencies; it does not isolate NCCL kernel time.
+
+The current implementation performs two gathers per managed layer per update:
+one for forward and one for backward. Both are instrumented. Each phase/layer
+entry in `all_gather_path` should contain `steps` samples for this model, where
+each managed layer is used once per update. Early release of backward weights
+and gradient buffers is the next memory optimization.
+
+For a local two-process CPU pipeline check (no GPU memory measurements):
+
+```sh
+uv run torchrun --standalone --nproc-per-node=2 -m cs336_systems.fsdp_benchmark \
+    --backend gloo --strategy fsdp --warmup-steps 1 --steps 2 \
+    --d-model 8 --d-ff 16 --num-layers 1 --num-heads 2 \
+    --vocab-size 16 --context-length 4 --global-batch-size 4 \
+    --output-dir results/fsdp/tiny-accounting
+```
+
+For local GPUs use `--backend nccl` and the desired model dimensions. OOMs write
+per-rank failure metadata and a CUDA memory summary; the Modal runner still saves
+the job logs and attempts subsequent strategies. Choose a new run/output name
+for each experiment.
 
 ## Submitting
 

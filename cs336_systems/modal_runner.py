@@ -23,6 +23,11 @@ MODEL_SIZES = ("small", "medium", "large", "xl", "10B")
 MODES = ("forward", "forward-backward", "train")
 ATTENTION_D_MODELS = "16,32,64,128"
 ATTENTION_SEQ_LENGTHS = "256,1024,4096,8192,16384"
+DDP_NSYS_ARGS = (
+    "--wait=all --capture-range=nvtx --nvtx-capture=ddp_measurement "
+    "--capture-range-end=stop --env-var=NSYS_NVTX_PROFILER_REGISTER_ONLY=0"
+)
+FSDP_NSYS_ARGS = DDP_NSYS_ARGS.replace("ddp_measurement", "fsdp_measurement")
 
 
 def archive_source(source: Path, destination: Path):
@@ -141,13 +146,13 @@ def ddp_jobs(mode: str = "benchmark", model_size: str = "xl", world_size: int = 
         raise ValueError("world_size must be 1–8; steps positive; benchmark requires warm-up")
     if mode == "train" and warmup_steps:
         raise ValueError("training does not discard warm-up updates")
-    if wrapper not in ("naive", "flat", "both") or (mode == "train" and wrapper == "both"):
-        raise ValueError("wrapper must be naive or flat (benchmark also accepts both)")
+    if wrapper not in ("naive", "flat", "overlap", "both", "all") or (mode == "train" and wrapper in ("both", "all")):
+        raise ValueError("wrapper must be naive, flat, or overlap (benchmark also accepts both or all)")
     extra = shlex.split(extra_args)
     reserved = {"--model-size", "--steps", "--warmup-steps", "--output-dir", "--backend", "--wrapper"}
     if any(arg.split("=", 1)[0] in reserved for arg in extra):
         raise ValueError(f"extra-args must not override DDP launch options: {sorted(reserved)}")
-    wrappers = ("naive", "flat") if wrapper == "both" else (wrapper,)
+    wrappers = {"both": ("naive", "flat"), "all": ("naive", "flat", "overlap")}.get(wrapper, (wrapper,))
     return [{"name": f"{variant}-ddp-{mode}", "allocator_conf": allocator_conf, "argv": [
         "torchrun", "--standalone", "--nnodes=1", f"--nproc-per-node={world_size}",
         "-m", f"cs336_systems.ddp_{mode}", "--backend", "nccl", "--model-size", model_size,
@@ -155,6 +160,30 @@ def ddp_jobs(mode: str = "benchmark", model_size: str = "xl", world_size: int = 
         "--steps", str(steps), "--warmup-steps", str(warmup_steps), *extra,
         "--output-dir", "{output_dir}",
     ]} for variant in wrappers]
+
+
+def fsdp_jobs(strategies: str = "ddp,optimizer_sharded,fsdp", model_size: str = "xl", world_size: int = 2,
+              compute_dtype: str = "float32", steps: int = 10, warmup_steps: int = 5, extra_args: str = "",
+              allocator_conf: str = "", profile_layers: bool = False) -> list[dict]:
+    """Compare section 6/7 strategies sequentially in one Modal GPU allocation."""
+    selected = [value.strip() for value in strategies.split(",")]
+    if not set(selected) <= {"ddp", "optimizer_sharded", "fsdp"} or len(selected) != len(set(selected)):
+        raise ValueError("strategies must be a unique comma-separated subset of ddp,optimizer_sharded,fsdp")
+    if model_size not in MODEL_SIZES or compute_dtype not in ("float32", "float16", "bfloat16"):
+        raise ValueError("invalid model-size or compute-dtype")
+    if not 1 <= world_size <= 8 or min(steps, warmup_steps) < 1:
+        raise ValueError("world-size must be 1–8 and steps/warmup-steps positive")
+    extra = shlex.split(extra_args)
+    reserved = {"--strategy", "--model-size", "--backend", "--compute-dtype", "--steps", "--warmup-steps", "--output-dir", "--profile-layers"}
+    if any(arg.split("=", 1)[0] in reserved for arg in extra):
+        raise ValueError(f"extra-args must not override FSDP launch options: {sorted(reserved)}")
+    return [{"name": f"{strategy}-{compute_dtype}-accounting", "allocator_conf": allocator_conf, "argv": [
+        "torchrun", "--standalone", "--nnodes=1", f"--nproc-per-node={world_size}",
+        "-m", "cs336_systems.fsdp_benchmark", "--backend", "nccl", "--strategy", strategy,
+        "--model-size", model_size, "--compute-dtype", compute_dtype,
+        "--steps", str(steps), "--warmup-steps", str(warmup_steps),
+        *(["--profile-layers"] if profile_layers else []), *extra, "--output-dir", "{output_dir}",
+    ]} for strategy in selected]
 
 
 def attention_jobs(
@@ -210,18 +239,18 @@ def execute_job(job: dict, output_dir: Path, cwd: Path, profile: bool = False, n
     """Stream combined stdout/stderr and preserve failure metadata for each process."""
     output_dir.mkdir(parents=True, exist_ok=False)
     command = command_argv(job["argv"], output_dir, profile, nsys_args)
-    record = {"name": job["name"], "command": command, "started_at": datetime.now(UTC).isoformat(), "status": "running"}
+    record = {"name": job["name"], "command": command, "started_at": datetime.now(UTC).isoformat(), "status": "running", "nsys_profile": profile}
     metadata = output_dir / "job.json"
     metadata.write_text(json.dumps(record, indent=2) + "\n")
     environment = os.environ.copy()
     # Set allocator configuration before torchrun (and its workers) import torch.
-    # Both variants receive identical settings when planned with wrapper=both.
+    # All compared variants receive identical allocator settings.
     allocator_conf = job.get("allocator_conf", "")
     if allocator_conf:
         environment["PYTORCH_ALLOC_CONF"] = allocator_conf
         environment.pop("PYTORCH_CUDA_ALLOC_CONF", None)  # Avoid a conflicting legacy alias.
     record["allocator_conf"] = environment.get("PYTORCH_ALLOC_CONF", environment.get("PYTORCH_CUDA_ALLOC_CONF", ""))
-    environment.update({"CS336_OUTPUT_DIR": str(output_dir), "PYTHONUNBUFFERED": "1"})
+    environment.update({"CS336_OUTPUT_DIR": str(output_dir), "PYTHONUNBUFFERED": "1", "CS336_NSYS_PROFILE": "1" if profile else "0"})
     # Fresh disk caches as well as a fresh process for every benchmark configuration.
     cache_dir = Path("/tmp/cs336-job-cache") / uuid.uuid4().hex
     environment.update({"TRITON_CACHE_DIR": str(cache_dir / "triton"), "TORCHINDUCTOR_CACHE_DIR": str(cache_dir / "inductor")})
@@ -260,6 +289,7 @@ def write_summary(directory: Path, records: list[dict]):
         "warmup_steps",
         "device_name",
         "dtype",
+        "compute_dtype",
         "mixed_precision",
         "context_length",
         "profile_memory",
@@ -279,6 +309,9 @@ def write_summary(directory: Path, records: list[dict]):
         "world_size",
         "global_batch_size",
         "communication_percent",
+        "gradient_sync_tail_percent",
+        "nsys_profile",
+        "timing_method",
         "allocator_conf",
     ]
     with (directory / "summary.csv").open("w", newline="") as stream:
@@ -304,11 +337,15 @@ def write_summary(directory: Path, records: list[dict]):
                             "world_size": result["config"].get("world_size", ""),
                             "global_batch_size": result["config"].get("global_batch_size", ""),
                             "communication_percent": result.get("communication_percent", ""),
+                            "gradient_sync_tail_percent": result.get("gradient_sync_tail_percent", ""),
+                            "nsys_profile": result["config"].get("nsys_profile", ""),
+                            "timing_method": result["config"].get("timing_method", ""),
                             "allocator_conf": result["config"].get("allocator_conf", ""),
                             **{
                                 key: result["config"].get(key, "")
                                 for key in (
                                     "dtype",
+                                    "compute_dtype",
                                     "mixed_precision",
                                     "context_length",
                                     "profile_memory",

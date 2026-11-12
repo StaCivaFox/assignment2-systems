@@ -11,11 +11,14 @@ import modal
 from cs336_systems.modal_runner import (
     ATTENTION_D_MODELS,
     ATTENTION_SEQ_LENGTHS,
+    DDP_NSYS_ARGS,
+    FSDP_NSYS_ARGS,
     archive_source,
     attention_jobs,
     benchmark_jobs,
     command_argv,
     ddp_jobs,
+    fsdp_jobs,
     distributed_communication_jobs,
     execute_job,
     run_name as make_run_name,
@@ -202,14 +205,19 @@ def ddp_benchmark(
     gpu: str = "",
     run_name: str = "",
     output_dir: str = "results/modal",
+    nsys: bool = False,
+    nsys_args: str = "",
     download: bool = True,
 ):
-    """Sections 5.2/5.3.1: choose naive, flat, or both sequentially on the same node."""
+    """Sections 5.2/5.3: naive, flat, overlap, both (naive/flat), or all; optional Nsight capture."""
+    if nsys_args and not nsys:
+        raise ValueError("--nsys-args requires --nsys")
     jobs = ddp_jobs("benchmark", model_size, world_size, steps, warmup_steps, extra_args, wrapper=wrapper, allocator_conf=allocator_conf)
     gpu_type = gpu or GPU.split(":", 1)[0]
     if ":" in gpu_type:
         raise ValueError("--gpu takes a GPU type; set the count with --world-size")
-    submit(jobs, run_name, output_dir, False, "", download, gpu_request=f"{gpu_type}:{world_size}")
+    profile_args = f"{DDP_NSYS_ARGS} {nsys_args}".strip() if nsys else ""
+    submit(jobs, run_name, output_dir, nsys, profile_args, download, gpu_request=f"{gpu_type}:{world_size}")
 
 
 @app.local_entrypoint()
@@ -225,12 +233,41 @@ def ddp_train(
     output_dir: str = "results/modal",
     download: bool = True,
 ):
-    """Train with naive or flat DDP, optional .npy tokens, and rank-0 checkpoints."""
+    """Train with naive, flat, or overlap DDP, optional .npy tokens, and rank-0 checkpoints."""
     jobs = ddp_jobs("train", model_size, world_size, steps, 0, extra_args, wrapper=wrapper, allocator_conf=allocator_conf)
     gpu_type = gpu or GPU.split(":", 1)[0]
     if ":" in gpu_type:
         raise ValueError("--gpu takes a GPU type; set the count with --world-size")
     submit(jobs, run_name, output_dir, False, "", download, gpu_request=f"{gpu_type}:{world_size}")
+
+
+@app.local_entrypoint()
+def fsdp_benchmark(
+    strategies: str = "ddp,optimizer_sharded,fsdp",
+    model_size: str = "xl",
+    compute_dtype: str = "float32",
+    world_size: int = 2,
+    steps: int = 10,
+    warmup_steps: int = 5,
+    extra_args: str = "",
+    allocator_conf: str = "",
+    gpu: str = "",
+    run_name: str = "",
+    output_dir: str = "results/modal",
+    nsys: bool = False,
+    nsys_args: str = "",
+    download: bool = True,
+):
+    """Section 7: memory accounting and layer all-gather profiles on one node."""
+    if nsys_args and not nsys:
+        raise ValueError("--nsys-args requires --nsys")
+    jobs = fsdp_jobs(strategies, model_size, world_size, compute_dtype, steps, warmup_steps, extra_args,
+                     allocator_conf=allocator_conf, profile_layers=nsys)
+    gpu_type = gpu or GPU.split(":", 1)[0]
+    if ":" in gpu_type:
+        raise ValueError("--gpu takes a GPU type; use --world-size for the count")
+    profile_args = f"{FSDP_NSYS_ARGS} {nsys_args}".strip() if nsys else ""
+    submit(jobs, run_name, output_dir, nsys, profile_args, download, gpu_request=f"{gpu_type}:{world_size}")
 
 
 @app.local_entrypoint()
