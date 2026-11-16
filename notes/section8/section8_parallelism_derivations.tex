@@ -1,0 +1,360 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,amsmath,amssymb,booktabs,array,xcolor}
+\usepackage[margin=19mm,headheight=14pt]{geometry}
+\usepackage{fancyhdr,hyperref}
+\definecolor{ink}{HTML}{193044}
+\definecolor{accent}{HTML}{087F8C}
+\hypersetup{colorlinks=true,linkcolor=accent,pdftitle={Section 8: Parallelism Derivations}}
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\small CS336 / SYSTEMS}
+\fancyhead[R]{\small SECTION 8: DERIVATION NOTES}
+\fancyfoot[C]{\thepage}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+\setlength{\abovedisplayskip}{7pt}\setlength{\belowdisplayskip}{7pt}
+\color{ink}
+\begin{document}
+
+
+\section*{Section 8: parallelism derivations}
+
+\textit{CS336 Assignment 2 \textperiodcentered{} Review notes \textperiodcentered{} Sections 8.1--8.5}\par
+
+These notes collect our derivations for one gated feed-forward layer. They retain the exact ring factors, distinguish full tensors from shards, and separate exact bounds from large-degree approximations.\par
+
+\begin{center}\begin{tabular}{p{0.14\linewidth}p{0.76\linewidth}}\toprule
+
+Symbol & Meaning\\\midrule
+
+B & Global number of input rows (the handout's batch size)\\
+
+D; D\_FF & Model dimension; feed-forward hidden dimension\\
+
+N & Number of GPUs in the collective or parallelism group\\
+
+C & Compute throughput per GPU, in FLOP/s\\
+
+W & Egress bandwidth per GPU, in bytes/s\\
+
+S; s & Full collective payload in bytes; bytes per element\\
+
+\bottomrule\end{tabular}\end{center}
+
+\subsection*{Assumptions and the bottleneck criterion}
+
+Use FP16 weights, activations, and communicated gradients: s = 2 bytes per element. Count only matrix multiplications. Ignore communication latency, reduction arithmetic, optimizer work, and memory-bandwidth limits. GPUs communicate concurrently.\par
+
+\[\boxed{t_{\mathrm{comp}}=\frac{\mathrm{FLOPs\ per\ GPU}}{C},\qquad t_{\mathrm{comm}}\leq t_{\mathrm{comp}}}\]
+
+The inequality is the handout's ideal compute-bound criterion. We compare forward and backward separately where requested. In Section 8.5, the problem explicitly specifies whether communication along the two axes overlaps.\par
+
+\subsection*{Why matrix multiplication costs approximately 2mnk FLOPs}
+
+A product with shapes (m, k) and (k, n) has mn output elements. Each is a dot product requiring k multiplications and k - 1 additions.\par
+
+\[\mathrm{FLOPs}=mn\,[k+(k-1)]=mn(2k-1)\simeq 2mnk\]
+
+A fused multiply-add counts as two floating-point operations. FLOPs is an operation count; FLOP/s is a rate. Using m, n, k here avoids confusing a matrix dimension with the hardware throughput C.\par
+
+{\small Source: cs336\_assignment2\_systems.pdf, Section 8, pp. 40--46. Notation follows the handout: W$_1$ and W$_2$ are the two input projections; W$_3$ is the output projection. Prepared from our derivation discussion.}\par
+
+\clearpage
+
+\section*{8.1 \textperiodcentered{} Ring communication}
+
+\textit{Count rounds $\times$ bytes per round $\div$ per-GPU bandwidth}\par
+
+\subsection*{All-gather and reduce-scatter}
+
+For all-gather, each GPU starts with one shard of size S/N and ends with the full tensor of size S. Each of N - 1 rounds sends one shard. Reduce-scatter has the same communication volume, with partial sums accumulated as shards circulate.\par
+
+\[\boxed{t_{\mathrm{AG}}=t_{\mathrm{RS}}=(N-1)\frac{S/N}{W}=\frac{N-1}{N}\frac{S}{W}}\]
+
+For reduce-scatter, S is the full input tensor size on each GPU; the output shard has size S/N. Sending and receiving proceed concurrently in this model, so do not add another factor of two for reception.\par
+
+\subsection*{Standard ring all-reduce}
+
+A reduce-scatter computes each GPU's shard of the global sum. An all-gather distributes those reduced shards to every GPU.\par
+
+\[\boxed{t_{\mathrm{AR}}=t_{\mathrm{RS}}+t_{\mathrm{AG}}=2\frac{N-1}{N}\frac{S}{W}}\]
+
+\subsection*{Problem: alternate ring all-reduce}
+
+The alternate algorithm circulates whole original tensors. There are N - 1 rounds and each GPU sends S bytes per round.\par
+
+\[\boxed{t_{\mathrm{alt}}=(N-1)\frac{S}{W},\qquad \frac{t_{\mathrm{alt}}}{t_{\mathrm{AR}}}=\frac{N}{2}\quad(N>1)}\]
+
+The algorithms tie at N = 2. Standard ring all-reduce is strictly faster for N > 2. At N = 1, both communication times are zero and the ratio is undefined.\par
+
+\subsection*{Full size versus shard size}
+
+\[S_{\mathrm{shard}}=\frac{S_{\mathrm{full}}}{N},\qquad t_{\mathrm{AG}}=\frac{N-1}{N}\frac{S_{\mathrm{full}}}{W}=(N-1)\frac{S_{\mathrm{shard}}}{W}\]
+
+Both forms are correct. Using a shard-sized S inside the first form divides by N twice. For an 8 GB full tensor on four GPUs, each GPU starts with 2 GB and receives three other shards: 6 GB in total.\par
+
+These are per-GPU elapsed-time models. Do not multiply by N to account for all devices: their transfers happen concurrently.\par
+
+\clearpage
+
+\section*{8.2 \textperiodcentered{} Data parallelism}
+
+\textit{Shard the batch; replicate the weights; synchronize weight gradients}\par
+
+\subsection*{The gated FFN and its matrix products}
+
+\[x_1=xW_1,\quad x_2=xW_2,\quad z=f(x_1)\odot x_2,\quad y=zW_3\]
+
+\[W_1,W_2\in\mathbb{R}^{D\times D_{\mathrm{FF}}},\quad W_3\in\mathbb{R}^{D_{\mathrm{FF}}\times D},\quad P=3DD_{\mathrm{FF}}\]
+
+Each GPU processes B/N\_DP rows. Backward contains six matmuls: one for dz, two contributing to dx, and three weight-gradient products. The elementwise derivatives are excluded from the FLOP count.\par
+
+\[dz=dyW_3^\top,\qquad dx=dx_1W_1^\top+dx_2W_2^\top\]
+
+\[dW_1=x^\top dx_1,\quad dW_2=x^\top dx_2,\quad dW_3=z^\top dy\]
+
+\subsection*{(a) Backward computation}
+
+\[\boxed{\mathrm{FLOPs}_{\mathrm{bwd}}=6\left(2\frac{B}{N_{\mathrm{DP}}}DD_{\mathrm{FF}}\right)=\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{DP}}}}\]
+
+\subsection*{(b) Backward communication}
+
+All-reduce the three full weight gradients. Their combined full payload is independent of the batch size. Summing their costs is valid because this model ignores collective launch latency.\par
+
+\[S_{\mathrm{grad}}=3DD_{\mathrm{FF}}\cdot 2=6DD_{\mathrm{FF}}\ \mathrm{bytes}\]
+
+\[\boxed{t_{\mathrm{comm,bwd}}=2\frac{N_{\mathrm{DP}}-1}{N_{\mathrm{DP}}}\frac{S_{\mathrm{grad}}}{W}=\frac{12(N_{\mathrm{DP}}-1)DD_{\mathrm{FF}}}{N_{\mathrm{DP}}W}}\]
+
+\subsection*{(c) Compute-bound scaling limit}
+
+\[\boxed{\frac{12(N_{\mathrm{DP}}-1)DD_{\mathrm{FF}}}{N_{\mathrm{DP}}W}\leq\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{DP}}C}\quad\Longrightarrow\quad N_{\mathrm{DP}}\leq 1+\frac{BW}{C}}\]
+
+D and D\_FF cancel: widening the layer adds computation and gradient bytes in the same proportion. Increasing B adds computation while each parameter still contributes only one locally accumulated gradient to all-reduce.\par
+
+\clearpage
+
+\section*{8.3 \textperiodcentered{} Fully sharded data parallelism}
+
+\textit{Shard persistent model state; reconstruct weights for local-batch computation}\par
+
+\subsection*{(a) Forward and backward computation}
+
+Each GPU still processes B/N\_FSDP input rows. All-gather restores the complete weight matrices before computation, so the matmul counts match DP: three forward and six backward.\par
+
+\[\boxed{\mathrm{FLOPs}_{\mathrm{fwd}}=\frac{6BDD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}},\qquad \mathrm{FLOPs}_{\mathrm{bwd}}=\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}}}\]
+
+\subsection*{(b) Communication}
+
+The combined full size of the three weights is S = 6DD\_FF bytes. Each GPU initially stores S/N\_FSDP bytes. Use the full S in the ring formula; its division by group size is already included.\par
+
+Forward all-gathers the three weights. After forward, the full weights are discarded. Backward all-gathers them again, then reduce-scatters the three full gradient tensors into reduced local shards.\par
+
+\[\boxed{t_{\mathrm{comm,fwd}}=\frac{N_{\mathrm{FSDP}}-1}{N_{\mathrm{FSDP}}}\frac{6DD_{\mathrm{FF}}}{W}}\]
+
+\[\boxed{t_{\mathrm{comm,bwd}}=2\frac{N_{\mathrm{FSDP}}-1}{N_{\mathrm{FSDP}}}\frac{6DD_{\mathrm{FF}}}{W}}\]
+
+\subsection*{(c) Scaling limits}
+
+\[\frac{6(N_{\mathrm{FSDP}}-1)DD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}W}\leq\frac{6BDD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}C}\quad(\mathrm{forward})\]
+
+\[\frac{12(N_{\mathrm{FSDP}}-1)DD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}W}\leq\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{FSDP}}C}\quad(\mathrm{backward})\]
+
+\[\boxed{N_{\mathrm{FSDP}}\leq 1+\frac{BW}{C}\qquad\mathrm{in\ both\ phases}}\]
+
+\subsection*{Why the two bounds agree}
+
+Backward has twice the computation and twice the communication of forward. Their communication/computation ratios therefore match. The backward communication cost also matches DP's all-reduce cost: one all-gather plus one reduce-scatter has the same ring cost as one all-reduce.\par
+
+Equal phase-wise scaling bounds do not imply equal step times. FSDP adds forward communication and reduces persistent memory per GPU. These formulas assume the weights are gathered again for backward.\par
+
+\clearpage
+
+\section*{8.4 \textperiodcentered{} Tensor parallel mechanics}
+
+\textit{Column-shard the two input projections; row-shard the output projection}\par
+
+Each GPU processes all B rows, but only a slice of the hidden dimension. The input and final output are replicated within the TP group.\par
+
+\[W_1^{(i)},W_2^{(i)}\in\mathbb{R}^{D\times(D_{\mathrm{FF}}/N_{\mathrm{TP}})},\qquad W_3^{(i)}\in\mathbb{R}^{(D_{\mathrm{FF}}/N_{\mathrm{TP}})\times D}\]
+
+\subsection*{Forward}
+
+\[x_1^{(i)}=xW_1^{(i)},\qquad x_2^{(i)}=xW_2^{(i)}\]
+
+\[z^{(i)}=f(x_1^{(i)})\odot x_2^{(i)},\qquad y^{(i)}=z^{(i)}W_3^{(i)}\]
+
+\[y=\operatorname{AllReduce}_{\mathrm{sum}}\!\left(y^{(i)}\right)=\sum_{i=0}^{N_{\mathrm{TP}}-1}y^{(i)}\]
+
+The output projection consumes the local hidden slice directly, so no intermediate all-gather is needed. Only the partial outputs must be summed.\par
+
+\subsection*{(a) Backward, given the same dy on every TP rank}
+
+\[dz^{(i)}=dy\left(W_3^{(i)}\right)^\top\]
+
+\[dx_1^{(i)}=dz^{(i)}\odot f'(x_1^{(i)})\odot x_2^{(i)},\qquad dx_2^{(i)}=dz^{(i)}\odot f(x_1^{(i)})\]
+
+\[dW_1^{(i)}=x^\top dx_1^{(i)},\quad dW_2^{(i)}=x^\top dx_2^{(i)},\quad dW_3^{(i)}=\left(z^{(i)}\right)^\top dy\]
+
+\[dx_{\mathrm{partial}}^{(i)}=dx_1^{(i)}\left(W_1^{(i)}\right)^\top+dx_2^{(i)}\left(W_2^{(i)}\right)^\top\]
+
+\[\boxed{dx=\operatorname{AllReduce}_{\mathrm{sum}}\!\left(dx_{\mathrm{partial}}^{(i)}\right)}\]
+
+Each local weight gradient is already complete for that weight shard, so it needs no TP reduction. Each partial input gradient contains only one hidden slice's contribution; summing across ranks reconstructs dx. This reduction is a sum, not an average.\par
+
+{\small dy is the gradient of one logical replicated output. Under the handout's backward convention, it is supplied to each rank without an additional TP all-reduce.}\par
+
+\clearpage
+
+\section*{8.4 \textperiodcentered{} Tensor parallel costs}
+
+\textit{Activation communication changes which dimension controls the scaling limit}\par
+
+\subsection*{(b) Computation}
+
+There are three forward and six backward matmuls. Each costs 2BDD\_FF/N\_TP FLOPs because the hidden dimension is sharded.\par
+
+\[\boxed{\mathrm{FLOPs}_{\mathrm{fwd}}=\frac{6BDD_{\mathrm{FF}}}{N_{\mathrm{TP}}},\qquad \mathrm{FLOPs}_{\mathrm{bwd}}=\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{TP}}}}\]
+
+\subsection*{(c) Communication}
+
+Forward all-reduces the partial output; backward all-reduces the partial input gradient. Both tensors have shape (B, D), hence a full payload of 2BD bytes.\par
+
+\[\boxed{t_{\mathrm{comm,fwd}}=t_{\mathrm{comm,bwd}}=2\frac{N_{\mathrm{TP}}-1}{N_{\mathrm{TP}}}\frac{2BD}{W}=\frac{4(N_{\mathrm{TP}}-1)BD}{N_{\mathrm{TP}}W}}\]
+
+\subsection*{(d) Forward scaling limit}
+
+\[\frac{4(N_{\mathrm{TP}}-1)BD}{N_{\mathrm{TP}}W}\leq\frac{6BDD_{\mathrm{FF}}}{N_{\mathrm{TP}}C}\]
+
+\[\boxed{N_{\mathrm{TP}}\leq 1+\frac{3D_{\mathrm{FF}}W}{2C}\qquad(\mathrm{forward})}\]
+
+\subsection*{Backward scaling limit}
+
+\[\frac{4(N_{\mathrm{TP}}-1)BD}{N_{\mathrm{TP}}W}\leq\frac{12BDD_{\mathrm{FF}}}{N_{\mathrm{TP}}C}\]
+
+\[\boxed{N_{\mathrm{TP}}\leq 1+\frac{3D_{\mathrm{FF}}W}{C}\qquad(\mathrm{backward})}\]
+
+Forward is more restrictive: it has half the computation but the same communication. To keep both phases compute-bound, use the forward bound.\par
+
+\subsection*{Why the batch size cancels}
+
+Increasing B increases both computation and activation payload proportionally. Increasing D\_FF adds computation without enlarging the communicated tensors of shape (B, D). Thus TP benefits from a wide hidden dimension, while DP/FSDP benefit from a large batch.\par
+
+\clearpage
+
+\section*{8.5 \textperiodcentered{} Combining FSDP and TP}
+
+\textit{Forward costs and the optimum when the two communication axes overlap}\par
+
+\[F=N_{\mathrm{FSDP}},\qquad T=N_{\mathrm{TP}},\qquad N=FT\]
+
+A rank (i, j) stores the following shards. FSDP all-gather reconstructs a TP weight slice, not the entire original weight matrix.\par
+
+\[W_{1,2}^{(i,j)}:\left(\frac{D}{F},\frac{D_{\mathrm{FF}}}{T}\right),\quad W_3^{(i,j)}:\left(\frac{D_{\mathrm{FF}}}{T},\frac{D}{F}\right),\quad x^{(j)}:\left(\frac{B}{F},D\right)\]
+
+\subsection*{(a) Forward computation}
+
+\[\boxed{\mathrm{FLOPs}_{\mathrm{fwd}}=\frac{6BDD_{\mathrm{FF}}}{FT},\qquad t_{\mathrm{comp}}=\frac{6BDD_{\mathrm{FF}}}{FTC}}\]
+
+\subsection*{(b) Forward communication}
+
+The full payload reconstructed within one FSDP group is 6DD\_FF/T bytes. The TP all-reduce covers the local batch, so its full payload is 2BD/F bytes.\par
+
+\[t_F=\frac{F-1}{F}\frac{6DD_{\mathrm{FF}}/T}{W}=\frac{6(F-1)DD_{\mathrm{FF}}}{FTW}\]
+
+\[t_T=2\frac{T-1}{T}\frac{2BD/F}{W}=\frac{4(T-1)BD}{FTW}\]
+
+\[\boxed{t_{\mathrm{comm}}=\max(t_F,t_T)}\]
+
+\subsection*{(c) Optimal degrees and maximum total GPU count}
+
+\[a=\frac{BW}{C},\qquad b=\frac{3D_{\mathrm{FF}}W}{2C},\qquad \frac{t_F}{t_{\mathrm{comp}}}=\frac{F-1}{a},\quad\frac{t_T}{t_{\mathrm{comp}}}=\frac{T-1}{b}\]
+
+Both communication times must be at most the compute time. The constraints are independent, so maximize both degrees.\par
+
+\[F\leq 1+a,\quad T\leq 1+b\quad\Longrightarrow\quad F_*=1+a,\quad T_*=1+b\]
+
+\[\boxed{N\leq N_{\max}^{\mathrm{overlap}}=(1+a)(1+b)=\left(1+\frac{BW}{C}\right)\left(1+\frac{3D_{\mathrm{FF}}W}{2C}\right)}\]
+
+{\small These are continuous optima. Actual degrees must be integers and support the required batch/weight partitioning. The max assumes the independent, overlapping communication resources specified in the problem.}\par
+
+\clearpage
+
+\section*{8.5 \textperiodcentered{} When communication adds}
+
+\textit{Part (d): exact continuous optimization, including single-axis boundary cases}\par
+
+Keep a = BW/C and b = 3D\_FF W/(2C). If the two collective families share network resources, their times add. The compute-bound constraint becomes:\par
+
+\[\boxed{t_F+t_T\leq t_{\mathrm{comp}}\quad\Longleftrightarrow\quad\frac{F-1}{a}+\frac{T-1}{b}\leq 1,\qquad F,T\geq 1}\]
+
+\subsection*{Interior optimum}
+
+At the maximum the constraint is tight. Substitute T into N = FT; the result is a concave quadratic in F.\par
+
+\[T=1+b-\frac{b}{a}(F-1),\qquad N(F)=F\left[1+b+\frac{b}{a}-\frac{b}{a}F\right]\]
+
+\[\frac{dN}{dF}=1+b+\frac{b}{a}-\frac{2b}{a}F=0,\qquad\frac{d^2N}{dF^2}=-\frac{2b}{a}<0\]
+
+\[F_* =\frac{a+1+a/b}{2},\qquad T_* =\frac{b+1+b/a}{2}\]
+
+\[\boxed{N_{\max}^{\mathrm{serial}}=\frac{(ab+a+b)^2}{4ab}\qquad(F_*\geq 1,\ T_*\geq 1)}\]
+
+\subsection*{Boundary cases: a parallelism degree cannot be below 1}
+
+\[a(b+1)<b:\qquad F_*=1,\quad T_*=1+b,\quad N_{\max}=1+b\]
+
+\[b(a+1)<a:\qquad T_*=1,\quad F_*=1+a,\quad N_{\max}=1+a\]
+
+{\small Otherwise the interior formula applies. Equality at a boundary gives the same answer in either formula. An equivalent universal construction is:}\par
+
+\[F_*=\min\!\left(1+a,\max\!\left(1,\frac{a+1+a/b}{2}\right)\right),\quad T_*=1+b-\frac{b}{a}(F_*-1)\]
+
+\subsection*{Large-degree approximation: a and b both much greater than 1}
+
+\[\boxed{F_*\simeq\frac{a}{2},\quad T_*\simeq\frac{b}{2},\quad N_{\max}^{\mathrm{serial}}\simeq\frac{ab}{4}=\frac{3BD_{\mathrm{FF}}W^2}{8C^2}}\]
+
+{\small With overlap, the maximum is approximately ab. Thus overlap supports about four times as many GPUs in this limit. The factor of four is asymptotic, not an exact statement for every a and b. Equal communication-time allocation is also an approximation in this limit.}\par
+
+\clearpage
+
+\section*{Review sheet \textperiodcentered{} What the bounds say}
+
+\textit{A compact reference for checking future derivations}\par
+
+\subsection*{Computation and communication at a glance}
+
+For each one-dimensional strategy, write n for its group size. All three have forward FLOPs 6BDD\_FF/n and backward FLOPs 12BDD\_FF/n. With s = 2, their communication times are:\par
+
+\[\mathrm{DP}:\qquad t_{\mathrm{fwd}}=0,\qquad t_{\mathrm{bwd}}=\frac{12(n-1)DD_{\mathrm{FF}}}{nW}\]
+
+\[\mathrm{FSDP}:\qquad t_{\mathrm{fwd}}=\frac{6(n-1)DD_{\mathrm{FF}}}{nW},\qquad t_{\mathrm{bwd}}=\frac{12(n-1)DD_{\mathrm{FF}}}{nW}\]
+
+\[\mathrm{TP}:\qquad t_{\mathrm{fwd}}=t_{\mathrm{bwd}}=\frac{4(n-1)BD}{nW}\]
+
+\subsection*{Generalizing to s bytes per communicated element}
+
+Keeping the matmul throughput C fixed, replacing two-byte communication by s-byte communication gives these degree bounds:\par
+
+\[N_{\mathrm{DP,bwd}},\ N_{\mathrm{FSDP,fwd}},\ N_{\mathrm{FSDP,bwd}}\ \leq\ 1+\frac{2BW}{sC}\]
+
+\[N_{\mathrm{TP,fwd}}\leq 1+\frac{3D_{\mathrm{FF}}W}{sC},\qquad N_{\mathrm{TP,bwd}}\leq 1+\frac{6D_{\mathrm{FF}}W}{sC}\]
+
+{\small For the 2D formulas, use a = 2BW/(sC) and b = 3D\_FF W/(sC). Hardware throughput itself can change with precision; the formulas isolate the communication element-size effect.}\par
+
+\subsection*{Why fixed-batch data parallelism eventually stops scaling}
+
+\[\rho_{\mathrm{DP}}\equiv\frac{t_{\mathrm{comm}}}{t_{\mathrm{comp}}}=\frac{s(n-1)C}{2BW}\]
+
+At fixed global B, adding GPUs shrinks the local computation while each rank still synchronizes the full gradient. The ratio grows with n. At fixed local batch q = B/n instead:\par
+
+\[\rho_{\mathrm{DP}}=\frac{sC}{2qW}\left(1-\frac{1}{n}\right)\ \longrightarrow\ \frac{sC}{2qW}\]
+
+The ratio approaches a constant. Growing the global batch with the GPU count can preserve systems efficiency, but changes the optimization setup. Wider layers alone do not improve the ideal DP/FSDP ratio; a wider hidden dimension does improve the TP ratio.\par
+
+\subsection*{A reusable derivation method}
+
+1. Write the local tensor shapes.  2. Count matmul FLOPs per rank.  3. Identify each collective's \textbf{full} payload and group size.  4. Convert FLOPs and bytes into times.  5. Compare communication with computation, then optimize the degrees if there is more than one axis.\par
+
+{\small Real performance also depends on utilization, latency, topology, memory capacity, and achievable overlap. The bounds above describe the handout's simplified bandwidth model.}\par
+
+\end{document}
